@@ -111,23 +111,6 @@ const Folder: React.FC = () => (
     </svg>
 );
 
-// 星星罐 · 存钱罐
-const Jar: React.FC = () => (
-    <svg viewBox="0 0 64 64" className="w-full h-full">
-        <defs>
-            <linearGradient id="mg-jar" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={A.pink1} stopOpacity="0.7" /><stop offset="1" stopColor={A.pink2} stopOpacity="0.85" /></linearGradient>
-            <clipPath id="mg-jar-clip"><path d="M20 20 q0 -4 4 -4 l16 0 q4 0 4 4 l0 26 q0 6 -6 6 l-12 0 q-6 0 -6 -6 z" /></clipPath>
-        </defs>
-        <rect x="22" y="9" width="20" height="7" rx="3.5" fill={A.pinkSh} stroke={A.pinkLine} strokeWidth="1.6" />
-        <path d="M20 20 q0 -4 4 -4 l16 0 q4 0 4 4 l0 26 q0 6 -6 6 l-12 0 q-6 0 -6 -6 z" fill="url(#mg-jar)" stroke={A.pinkLine} strokeWidth="1.8" strokeLinejoin="round" />
-        <g clipPath="url(#mg-jar-clip)"><rect x="32" y="16" width="14" height="40" fill={A.pinkSh} opacity="0.3" /></g>
-        <Sparkle x={32} y={35} s={9} c={A.gloss} />
-        <path d={`M32 ${35 - 9} L${32 + 9 * 0.3} ${35 - 9 * 0.3} L${32 + 9} 35 L${32 + 9 * 0.3} ${35 + 9 * 0.3} L32 ${35 + 9} L${32 - 9 * 0.3} ${35 + 9 * 0.3} L${32 - 9} 35 L${32 - 9 * 0.3} ${35 - 9 * 0.3} Z`} fill="none" stroke={A.pinkLine} strokeWidth="1.2" strokeLinejoin="round" />
-        <ellipse cx="26" cy="26" rx="2.5" ry="7" fill={A.gloss} opacity="0.4" />
-        <Sparkle x={49} y={15} s={4} c={A.pink1} />
-    </svg>
-);
-
 // 日历（带勾）· 日程
 const Calendar: React.FC = () => (
     <svg viewBox="0 0 64 64" className="w-full h-full">
@@ -164,7 +147,6 @@ const MG_ART: Partial<Record<AppID, React.FC>> = {
     [AppID.CheckPhone]: Smartphone,
     [AppID.Date]: Diary,
     [AppID.User]: Folder,
-    [AppID.Bank]: Jar,
     [AppID.Schedule]: Calendar,
     [AppID.Settings]: Gear,
 };

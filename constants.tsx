@@ -20,7 +20,6 @@ import {
   GameController,
   Globe,
   PenNib,
-  PiggyBank,
   Compass,
   Camera,
   Sparkle,
@@ -59,7 +58,6 @@ export const Icons: Record<string, React.FC<{ className?: string }>> = {
   Game: ({ className }) => <GameController className={className} weight="regular" />,
   Worldbook: ({ className }) => <Globe className={className} weight="regular" />,
   Novel: ({ className }) => <PenNib className={className} weight="regular" />,
-  Bank: ({ className }) => <PiggyBank className={className} weight="regular" />,
   XhsFreeRoam: ({ className }) => <Compass className={className} weight="regular" />,
   XhsStock: ({ className }) => <Camera className={className} weight="regular" />,
   SpecialMoments: ({ className }) => <Sparkle className={className} weight="regular" />,
@@ -91,7 +89,6 @@ export const INSTALLED_APPS: AppConfig[] = [
   // { id: AppID.Browser, name: '浏览器', icon: 'Browser', color: 'blue' }, // Hidden
   { id: AppID.Date, name: '见面', icon: 'Date', color: 'pink' },
   { id: AppID.User, name: '档案', icon: 'User', color: 'blue' },
-  { id: AppID.Bank, name: '存钱罐', icon: 'Bank', color: 'lime' }, // Hidden
   { id: AppID.Journal, name: '交换日记', icon: 'Journal', color: 'amber' },
   // { id: AppID.Handbook, name: '手账', icon: 'Handbook', color: 'fuchsia' }, // Hidden temporarily, pending update
   { id: AppID.Social, name: 'Spark', icon: 'Social', color: 'red' },

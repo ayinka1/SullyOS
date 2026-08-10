@@ -92,12 +92,6 @@ const ACNH_ICON_MAP: Partial<Record<AppID, React.ReactNode>> = {
     <path d="M45 47 Q50 51 55 47" stroke={BROWN} strokeWidth="2.4" fill="none" strokeLinecap="round" />
     <rect x="34" y="62" width="32" height="5" rx="2.5" fill={BROWN} /><rect x="38" y="71" width="24" height="5" rx="2.5" fill="#B7A98C" />
   </>),
-  [AppID.Bank]: draw([20, 27, 80, 87], <>
-    <path d="M37 35 Q50 27 63 35 C77 46 80 67 69 79 C61 87 39 87 31 79 C20 67 23 46 37 35Z" fill={CREAM} />
-    <path d="M41 31 L59 31 L55 40 L45 40Z" fill={BROWN} />
-    <path d="M50 50 C43 50 39 56 39 63 H61 C61 56 57 50 50 50Z" fill="#F7CD67" />
-    <rect x="46" y="63" width="8" height="3.5" fill={BROWN} /><circle cx="50" cy="70" r="3" fill={BROWN} />
-  </>),
   [AppID.GroupChat]: draw([17, 31, 83, 73], <>
     <circle cx="64" cy="52" r="19" fill="#EFE6CF" /><circle cx="38" cy="52" r="21" fill={CREAM} />
     <circle cx="31" cy="50" r="3.4" fill={BROWN} /><circle cx="45" cy="50" r="3.4" fill={BROWN} />

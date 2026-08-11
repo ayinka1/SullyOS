@@ -70,6 +70,7 @@ import {
   getInstantChatPending,
   getStagedInstantChatExpiredNotices,
   isInstantChatReady,
+  resetInstantChatReprobeCooldown,
   resolveInstantChatReadiness,
   sendInstantChatTurn,
   setInstantChatPending,
@@ -553,8 +554,22 @@ describe('开关', () => {
   // 新 bundle 少了起跳器直接 503。用户开着开关也得让位给本地生成，否则他对着
   // 「正在输入…」等一条永远不来的回复，而设置页写着「已开启」。
 
-  it('探到 Worker 跑不动 → 用户开着也不走云端（reason worker-outdated）', async () => {
+  // 存量是粘的（只有探测成功才翻得回来），所以让位之前一定要先现探一次——下面四条钉的
+  // 就是这次现探的四种去向。
+
+  /** 存量说跑不动 + 摆好「这次现探会问到什么」。 */
+  const stageOutdatedWithProbe = (outcome: 'supported' | 'unsupported' | 'unknown') => {
     storeState.config = { ...storeState.config, instantChatEnabled: true, instantChatSupported: false };
+    // 冷却是模块级状态，会串到别的用例上去。
+    resetInstantChatReprobeCooldown();
+    return vi.spyOn(ActiveMsgClient, 'probeInstantChatSupportDetailed').mockResolvedValue({
+      outcome,
+      supported: outcome === 'supported' ? true : outcome === 'unsupported' ? false : undefined,
+    });
+  };
+
+  it('现探确认跑不动 → 用户开着也不走云端（reason worker-outdated）', async () => {
+    stageOutdatedWithProbe('unsupported');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* 静音，只数次数 */ });
     const readiness = await resolveInstantChatReadiness();
     expect(readiness).toEqual({ ready: false, reason: 'worker-outdated' });
@@ -563,6 +578,35 @@ describe('开关', () => {
     expect(readiness.reason).not.toBe('disabled');
     // 静默让位正是「静默分流」那个坑，必须留声。
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  // ★ 这条是「一次抖动 ≠ 长期降级」的守卫。
+  // 从前存量一旦是 false 就直接判死，而写下这个 false 的可能只是一次网络抖动——用户不
+  // 碰巧打开设置页就一直卡在本地生成（线上真实故障：Worker 全绿，用户连着几小时全走本地，
+  // 而他的本地直连根本不通）。现在发消息路上会现探一次，好了立刻回到云端。
+  it('存量说跑不动、现探却发现已经好了 → 这一轮就回到云端（不必等用户去开设置页）', async () => {
+    stageOutdatedWithProbe('supported');
+    expect(await resolveInstantChatReadiness()).toEqual({ ready: true });
+  });
+
+  // 够不着云端时不能指人去「更新 Worker」：他多半点不动，而且问题也不在那儿。
+  it('现探够不着云端 → 单独一档 worker-unreachable，不叫人去更新 Worker', async () => {
+    stageOutdatedWithProbe('unknown');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* 静音，只数次数 */ });
+    const readiness = await resolveInstantChatReadiness();
+    expect(readiness).toEqual({ ready: false, reason: 'worker-unreachable' });
+    expect(readiness.reason).not.toBe('worker-outdated');
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  // 现探是加在发消息路上的，连发几条消息不能变成一串 /config-check。
+  it('冷却期内不重复现探（连发三条只探一次）', async () => {
+    const probe = stageOutdatedWithProbe('unsupported');
+    vi.spyOn(console, 'warn').mockImplementation(() => { /* 静音 */ });
+    await resolveInstantChatReadiness();
+    await resolveInstantChatReadiness();
+    await resolveInstantChatReadiness();
+    expect(probe).toHaveBeenCalledTimes(1);
   });
 
   it('没探过（undefined）→ 放行：不知道 ≠ 知道它不行', async () => {
@@ -909,5 +953,22 @@ describe('第一次接上服务端账本', () => {
 
     expect(written).toBe(1);
     expect(storeState.saved.map((m: any) => m.messageId)).toEqual(['m-new']);
+  });
+
+  // 自动路径把存量整批销掉是对的（分不清哪些是真丢的），但对「我确实少收了消息」的
+  // 用户来说，那批存量恰恰就是他要找的东西——销了就再也拿不回来了。所以手动补收
+  // 这条路要能越过接管：用户自己知道自己丢了，这个判断他做得了。
+  it('手动补收越过首次接管，存量照样上屏', async () => {
+    stubOutboxOnce([entry('m-missed', 'uuid-missed')]);
+    const ack = vi.spyOn(ActiveMsgClient, 'ackOutboxMessages').mockResolvedValue(undefined);
+
+    const { written } = await drainOutbox({ treatBacklogAsMissed: true });
+
+    expect(written).toBe(1);
+    expect(storeState.saved.map((m: any) => m.messageId)).toEqual(['m-missed']);
+    // 没被当存量销掉：销账要等落库走完那一步（backfill 里 written 的那条不进 ackNow）。
+    expect(ack).not.toHaveBeenCalledWith(['m-missed']);
+    // 手动补过一次就算接上了，后面回到自动路径，别下次又把新条目当存量销掉。
+    expect(localStorage.getItem(AMSG_OUTBOX_ADOPTED_LS_KEY)).toBeTruthy();
   });
 });

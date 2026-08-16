@@ -8,6 +8,8 @@ import {
   OrphanedCharacterError,
   PUSH_SUBSCRIPTION_CHANGED_KV_ID,
   buildSelfLogEntryId,
+  catchUpMissedPushes,
+  resetOutboxCatchUpThrottleForTesting,
   findInboxArtifacts,
   findMissingChunkIndexes,
   findPersistedChunkIndexes,
@@ -22,14 +24,18 @@ import {
   revokeSwallowedSelfLogEntry,
   runInstantChatStatusCheck,
   cancelLateEmotionPoll,
+  describeMultipartFailure,
   handleInstantErrorPushMessage,
   startLateEmotionPoll,
 } from './activeMsgRuntime';
+import { MULTIPART_FAILURE_REASON } from '@rei-standard/amsg-shared';
 import {
   AMSG_INSTANT_CHAT_PENDING_LS_KEY,
+  AMSG_OUTBOX_ADOPTED_LS_KEY,
   INSTANT_CHAT_STATUS_CHECK_INTERVAL_MS,
   getInstantChatPending,
   getStagedInstantChatExpiredNotices,
+  listInstantChatPendings,
   setInstantChatPending,
   stageInstantChatExpiredNotices,
 } from './amsgInstantChat';
@@ -2423,5 +2429,183 @@ describe('error push 到页面 → 当场收尾（handleInstantErrorPushMessage�
     await handleInstantErrorPushMessage({ metadata: { charId }, code: 'SOME_DIAG', message: 'x' });
 
     expect(getInstantChatPending(charId)?.uuid).toBe('uuid-untouched');
+  }, 20000);
+
+  // worker 把稳定的 errorCode 一起挂在 push 上（amsg-server 给 fire 抛的错误挂了 code）。
+  // 不带过去的话，秒级到达的这条直发告知只能说一句笼统的「生成失败」，而 60s 点名那条
+  // 路读得到同一个码、说的是「模型接口拒了，去查 Key」——同一次失败两种说法。
+  it('push 上带 errorCode → 用它给能照着做的话，跟点名路径同一份翻译', async () => {
+    const charId = 'char-errpush-code';
+    await DB.saveCharacter({ id: charId, name: '报错角色' } as any);
+    setInstantChatPending(charId, 'uuid-errpush-code');
+
+    await handleInstantErrorPushMessage({
+      metadata: {
+        charId,
+        taskUuid: 'uuid-errpush-code',
+        reason: 'AI API error: 401 Unauthorized. Request URL: https://api.example.com/v1/chat/completions\n'
+          + '  — Incorrect API key provided: sk-[redacted]. (provider code: invalid_api_key)',
+        errorCode: 'LLM_CALL_FAILED',
+      },
+    });
+
+    const msgs = await DB.getRecentMessagesByCharId(charId, 10);
+    const note = msgs.find((m: any) => m.role === 'system' && String(m.content).includes('即时对话没能完成'));
+    expect(String(note!.content)).toContain('模型接口拒了这次请求');
+    expect(String(note!.content)).toContain('invalid_api_key');
+  }, 20000);
+});
+
+// 一条推送装不下的内容会切成分片发出，SW 收齐还原。拼不起来的原因不都一样：等超时
+// 重开一下多半就好，而分片对不上 / 超限那几种重开没用。混成同一句「消息接收不完整」
+// 的话，用户对着一条永远修不好的提示反复重开。
+describe('分片拼不起来时说的那句话（describeMultipartFailure）', () => {
+  it('等超时 → 说没等齐，建议重开', () => {
+    const text = describeMultipartFailure(MULTIPART_FAILURE_REASON.TTL_EXPIRED);
+    expect(text).toContain('没在时限内到齐');
+    expect(text).toContain('重开');
+  });
+
+  it('本机存储写不进去 → 指向存储空间，不叫人重开', () => {
+    const text = describeMultipartFailure(MULTIPART_FAILURE_REASON.STORAGE_FAILED);
+    expect(text).toContain('存储');
+  });
+
+  it('分片本身有问题的几种 → 照实说是数据问题，别让人以为重开能好', () => {
+    for (const reason of [
+      MULTIPART_FAILURE_REASON.INVALID_CHUNK,
+      MULTIPART_FAILURE_REASON.CHUNK_CONFLICT,
+      MULTIPART_FAILURE_REASON.SIZE_LIMIT_EXCEEDED,
+      MULTIPART_FAILURE_REASON.RESTORE_FAILED,
+      MULTIPART_FAILURE_REASON.DISABLED,
+    ]) {
+      const text = describeMultipartFailure(reason);
+      expect(text, reason).toContain('分片数据有问题');
+      expect(text, reason).not.toContain('重开');
+    }
+  });
+
+  // 老 SW 不带 reason（字段是 2.4.0-next.4 加的），照样得给一句完整的话。
+  it('没有 reason → 走通用文案，不出现 undefined', () => {
+    const text = describeMultipartFailure(undefined);
+    expect(text).toContain('没接收完整');
+    expect(text).not.toContain('undefined');
+  });
+});
+
+// 这一组钉的是一次真实事故：定时主动消息到点生成好了、账本也记了、推送也发出去了，
+// 但在网络层丢了（代理断流、推送服务连不上）。worker 日志全绿、任务照常消费、订阅
+// 也没被退回，用户那边就是再也收不到——而云端账本上明明躺着那几条。
+//
+// 病根不在补收本身，在**什么时候去补**：拉账本的时机当初只挂在「即时对话正等着回复」
+// 上，而定时主动消息由云端到点自己发，客户端从来不产生那个状态，于是永远没人去捞。
+//
+// 所以这里钉死的不变量只有一条：**一条待收记录都没有时，上线补收照样要去拉账本。**
+describe('上线补收不看有没有在等回复（走真库）', () => {
+  const WORKER_URL = 'https://amsg-catchup.example.workers.dev';
+
+  beforeAll(() => {
+    (globalThis as any).window ??= { dispatchEvent: () => true, addEventListener: () => {} };
+  });
+
+  beforeEach(async () => {
+    localStorage.removeItem(AMSG_INSTANT_CHAT_PENDING_LS_KEY);
+    // 这一组测的都是「已经接上账本之后」的常规补收；首次接管那条路（存量整批销账、
+    // 不上屏）有自己的一组，见 amsgInstantChat.test.ts。
+    localStorage.setItem(AMSG_OUTBOX_ADOPTED_LS_KEY, JSON.stringify({ at: Date.now() }));
+    resetOutboxCatchUpThrottleForTesting();
+    await ActiveMsgStore.saveGlobalConfig({ workerUrl: WORKER_URL });
+    vi.spyOn(ActiveMsgClient, 'ackOutboxMessages').mockResolvedValue(undefined);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await ActiveMsgStore.saveGlobalConfig({ workerUrl: '' });
+  });
+
+  /** 账本上的一条定时主动消息（`push` 就是推送信封本身，跟 SW 收到的那份逐字一致）。 */
+  const scheduledEntry = (charId: string, messageId: string) => ({
+    id: 1,
+    messageId,
+    taskUuid: 'uuid-scheduled',
+    sessionId: 'sess-scheduled',
+    messageIndex: 1,
+    totalMessages: 1,
+    createdAt: Date.now(),
+    deliveredAt: Date.now(),
+    push: {
+      messageKind: 'content',
+      messageType: 'scheduled',
+      source: 'scheduled',
+      message: '到点啦，该睡觉了',
+      contactName: '定时角色',
+      messageId,
+      sessionId: 'sess-scheduled',
+      messageIndex: 1,
+      totalMessages: 1,
+      taskUuid: 'uuid-scheduled',
+      timestamp: new Date().toISOString(),
+      metadata: { charId, charName: '定时角色' },
+    },
+  });
+
+  it('一条待收记录都没有，冷启动照样去账本上捞', async () => {
+    const list = vi.spyOn(ActiveMsgClient, 'listOutboxEntries').mockResolvedValue([]);
+
+    expect(listInstantChatPendings()).toHaveLength(0);
+    await expect(catchUpMissedPushes('startup')).resolves.toBe('drained');
+    expect(list).toHaveBeenCalledTimes(1);
+  }, 20000);
+
+  it('回到前台同样不看待收记录', async () => {
+    const list = vi.spyOn(ActiveMsgClient, 'listOutboxEntries').mockResolvedValue([]);
+
+    expect(listInstantChatPendings()).toHaveLength(0);
+    await expect(catchUpMissedPushes('foreground')).resolves.toBe('drained');
+    expect(list).toHaveBeenCalledTimes(1);
+  }, 20000);
+
+  it('推送丢掉的那条定时主动消息，从账本补回聊天流', async () => {
+    const charId = 'char-catchup-scheduled';
+    const messageId = 'msg_task_67@1786434120000_hook_0';
+    await DB.saveCharacter({ id: charId, name: '定时角色' } as any);
+    vi.spyOn(ActiveMsgClient, 'listOutboxEntries')
+      .mockResolvedValue([scheduledEntry(charId, messageId)] as any);
+
+    expect(listInstantChatPendings()).toHaveLength(0);
+    await expect(catchUpMissedPushes('startup')).resolves.toBe('drained');
+
+    const msgs = await DB.getRecentMessagesByCharId(charId, 10);
+    expect(msgs.some((m: any) => String(m.content ?? '').includes('到点啦，该睡觉了'))).toBe(true);
+  }, 20000);
+
+  it('不到节流窗口的第二趟不打网络', async () => {
+    const list = vi.spyOn(ActiveMsgClient, 'listOutboxEntries').mockResolvedValue([]);
+
+    await expect(catchUpMissedPushes('startup')).resolves.toBe('drained');
+    await expect(catchUpMissedPushes('foreground')).resolves.toBe('throttled');
+    expect(list).toHaveBeenCalledTimes(1);
+  }, 20000);
+
+  it('手动补收不受节流管（用户自己知道丢了才点）', async () => {
+    const list = vi.spyOn(ActiveMsgClient, 'listOutboxEntries').mockResolvedValue([]);
+
+    await expect(catchUpMissedPushes('startup')).resolves.toBe('drained');
+    await expect(catchUpMissedPushes('manual')).resolves.toBe('drained');
+    expect(list).toHaveBeenCalledTimes(2);
+  }, 20000);
+
+  it('没配 Worker 的用户一个请求都不发', async () => {
+    await ActiveMsgStore.saveGlobalConfig({ workerUrl: '' });
+    const list = vi.spyOn(ActiveMsgClient, 'listOutboxEntries').mockResolvedValue([]);
+
+    await expect(catchUpMissedPushes('startup')).resolves.toBe('worker-unset');
+    expect(list).not.toHaveBeenCalled();
+  }, 20000);
+
+  it('账本读不成只是「这趟没读成」，不当成「账本上没有」', async () => {
+    vi.spyOn(ActiveMsgClient, 'listOutboxEntries').mockRejectedValue(new Error('worker 500'));
+
+    await expect(catchUpMissedPushes('startup')).resolves.toBe('failed');
   }, 20000);
 });

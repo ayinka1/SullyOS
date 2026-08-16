@@ -115,6 +115,45 @@ export const makeStoryTheaterId = (): string => (
 
 export const storyTheaterThreadId = (entryId: string): string => `story-theater:${entryId}`;
 
+const formatStoryExportTime = (timestamp: number): string => {
+    const date = new Date(timestamp);
+    if (!Number.isFinite(date.getTime())) return '未知时间';
+    const pad = (value: number) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+};
+
+/** 把一条剧情的完整中央线程导出为便于长期保存与检索的纯文字原文。 */
+export const formatStoryTheaterExport = (
+    entry: Pick<StoryTheaterEntry, 'title' | 'premise' | 'writesToCharacterMemory'>,
+    identityName: string,
+    actorNames: string[],
+    messages: Message[],
+    exportedAt: number = Date.now(),
+): string => {
+    const title = entry.title.trim() || '未命名剧情';
+    const userLabel = identityName.trim() || '你';
+    const lines = [
+        `剧情记录 · ${title}`,
+        `模式：${entry.writesToCharacterMemory ? '真实时间陪伴' : '虚构剧场'}`,
+        `你：${userLabel}`,
+        `角色：${actorNames.filter(Boolean).join('、') || '暂无'}`,
+        `导出时间：${formatStoryExportTime(exportedAt)}`,
+    ];
+    if (entry.premise.trim()) lines.push(`剧情简介：${entry.premise.trim()}`);
+    lines.push('', '===== 完整原文 =====');
+
+    for (const message of [...messages].sort((a, b) => a.id - b.id)) {
+        const speaker = message.role === 'user' ? userLabel : message.role === 'assistant' ? '剧场正文' : '系统';
+        lines.push('', `[${formatStoryExportTime(message.timestamp)}] ${speaker}`, message.content?.trim() || '（无内容）');
+    }
+    return `\uFEFF${lines.join('\n')}`;
+};
+
+export const makeStoryTheaterFileName = (title: string, now: number = Date.now()): string => {
+    const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').trim() || '未命名剧情';
+    return `${safeTitle}_剧情记录_${formatStoryExportTime(now).slice(0, 10)}.txt`;
+};
+
 export const createStoryTheaterDraft = (now: number = Date.now()): StoryTheaterEntry => ({
     id: makeStoryTheaterId(),
     title: '',
@@ -1233,6 +1272,43 @@ export const estimateStoryTokens = (text: string): number => {
     const cjk = (text.match(/[\u3400-\u9fff\uf900-\ufaff]/g) || []).length;
     const rest = Math.max(0, text.length - cjk);
     return cjk + Math.ceil(rest / 4);
+};
+
+const storyApiDetail = (value: unknown): string => {
+    if (typeof value === 'string') return value.trim();
+    if (!value || typeof value !== 'object') return '';
+    const record = value as Record<string, unknown>;
+    return storyApiDetail(record.message)
+        || storyApiDetail(record.detail)
+        || storyApiDetail(record.error)
+        || storyApiDetail(record.code);
+};
+
+/** 保留上游 4xx 的真正原因，避免调试日志里只剩一条没有信息量的 “API Error 400”。 */
+export const describeStoryApiError = (status: number, data: unknown): string => {
+    const detail = storyApiDetail((data as Record<string, unknown> | null)?.error)
+        || storyApiDetail((data as Record<string, unknown> | null)?.message)
+        || storyApiDetail((data as Record<string, unknown> | null)?.detail);
+    return `API Error ${status}${detail ? `：${detail.slice(0, 500)}` : ''}`;
+};
+
+export const isStoryUserLastCompatibilityError = (message: string): boolean => (
+    /(?:last|final)[^\n]{0,80}(?:message|role)[^\n]{0,80}user/i.test(message)
+    || /(?:最后|末尾)[^\n]{0,40}(?:消息|角色)[^\n]{0,40}user/i.test(message)
+);
+
+/** 200 但正文为空时把 finish_reason 带出来，区分截断、内容过滤和代理空包。 */
+export const describeEmptyStoryCompletion = (data: unknown): string => {
+    const record = data as Record<string, any> | null;
+    const choice = record?.choices?.[0];
+    const finishReason = String(choice?.finish_reason || choice?.finishReason || '').trim();
+    const providerDetail = storyApiDetail(record?.error) || storyApiDetail(record?.message);
+    if (providerDetail) return `没有生成正文：${providerDetail.slice(0, 500)}`;
+    if (finishReason === 'length' || finishReason === 'max_tokens') {
+        return '没有生成正文：模型在写出正文前已用完输出额度（finish_reason=length）。请提高“最大输出”，或降低模型思考量后重试';
+    }
+    if (finishReason === 'content_filter') return '没有生成正文：上游内容过滤拦截了本次回复（finish_reason=content_filter）';
+    return `没有生成正文${finishReason ? `（finish_reason=${finishReason}）` : '：上游返回了空内容'}，请重试`;
 };
 
 export const memoryTimestampForCharacter = (entry: StoryTheaterEntry, charId: string, realTimestamp: number): number => {

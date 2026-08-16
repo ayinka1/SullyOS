@@ -74,6 +74,40 @@ function summarizeGroupMsgContent(m: Message): string {
     }
 }
 
+export type ChatModeTransition = 'call' | 'video' | 'date' | 'story';
+
+const getChatModeTransition = (message: Message): ChatModeTransition | null => {
+    const source = message.metadata?.source;
+    if (source === 'date') return 'date';
+    if (source === 'story_theater' || source === 'story_theater_memory') return 'story';
+    if (source === 'call' || source === 'call-end-popup') {
+        return message.metadata?.callMode === 'video' ? 'video' : 'call';
+    }
+    return null;
+};
+
+/**
+ * 判断当前是不是「从特殊互动模式回到 ChatApp 后，尚未产生普通聊天回复」的第一轮。
+ *
+ * 用户可能连续发送多个气泡再点生成，所以普通 user 消息不会截断搜索；一旦已经出现
+ * 普通 assistant 回复，就说明格式切换已经完成，不应在后续每一轮重复提醒。
+ * 普通 system 日志也不参与判断，避免挂断卡片与其他后台提示把真正的来源隔开。
+ */
+export const detectChatModeTransition = (messages: readonly Message[]): ChatModeTransition | null => {
+    let hasPendingChatInput = false;
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        const mode = getChatModeTransition(message);
+        if (mode) return hasPendingChatInput ? mode : null;
+
+        if (message.role === 'assistant') return null;
+        if (message.role === 'user') hasPendingChatInput = true;
+    }
+
+    return null;
+};
+
 /**
  * buildSystemPrompt / buildSystemPromptParts 的构建选项。
  *
@@ -93,6 +127,8 @@ function summarizeGroupMsgContent(m: Message): string {
  */
 export interface PromptBuildOptions {
     forFirePack?: boolean;
+    /** 主 API 从完整数据库历史识别出的「刚从哪种模式回到 ChatApp」。 */
+    returningFromMode?: ChatModeTransition;
     /**
      * `timelyByWorker` = 这份 prompt 会交给 amsg worker 在 fire 时刻补时效段
      * （即时对话路径）。与 forFirePack 的区别：只裁「worker 那边有对应槽位」的
@@ -460,11 +496,16 @@ ${groupLogStr}\n`;
         // ── 拼接：易变的进 volatileState，稳定的进 baseSystemPrompt ──
         volatileState += realtimeText;
 
-        // 2a. 日程注入（当前时段 + 意识流独白，每轮都可能变）
+        // 2a. 日程注入（完整今日日程 + 当前时段 + 意识流独白，每轮都可能变）
         //     fire_pack 不烤：改由 worker 到点用 AMSG_SLOT_SCENE 现挑时段（见 amsgFireScene）。
         if (schedule && !forFirePack) {
             try {
-                const scheduleContext = ContextBuilder.buildScheduleInjection(schedule, evolvedNarrative, charNow);
+                const scheduleContext = ContextBuilder.buildScheduleInjection(
+                    schedule,
+                    evolvedNarrative,
+                    charNow,
+                    { includeFullDay: true, includeChangeInstruction: true },
+                );
                 if (scheduleContext) volatileState += `\n${scheduleContext}\n`;
             } catch (e) {
                 console.error('Failed to inject schedule context:', e);
@@ -487,8 +528,8 @@ ${groupLogStr}\n`;
                     charListening = { songId: cur.songId, songName: cur.songName, artists: cur.artists, vibe: cur.vibe };
                     // 拉歌词。优先用调用方传进来的 cfg；没传就从 localStorage 取
                     // —— Proactive / activeMsgClient 走这条路也能享受到歌词。
-                    const cfgForLyric = musicCfg?.workerUrl ? musicCfg : loadMusicCfgStandalone();
-                    if (cfgForLyric?.workerUrl) {
+                    const cfgForLyric = musicCfg ?? loadMusicCfgStandalone();
+                    if (cfgForLyric) {
                         try {
                             const slot = getCurrentSlot(schedule, charNow);
                             const seed = `${char.id}-${today}-${slot?.startTime || '00:00'}-${cur.songId}`;
@@ -583,6 +624,7 @@ ${uname} 的化身正挂在《彼方》的【${roomName}】${act ? `，状态写
             && !(timelyByWorker && isAmsg2EnabledForChar(char));
 
         baseSystemPrompt += `### 聊天 App 行为规范 (Chat App Rules)
+**TOP 1｜ChatApp 格式（本节最高优先级）**：你是发消息的真实存在，以自然短句、短气泡为主；一个气泡一行，气泡间直接另起一行（实际换行，不要输出“\\n”字样）。
             **严格注意，你正在手机聊天，无论之前是什么模式，哪怕上一句话你们还面对面在一起，当前，你都是已经处于线上聊天状态了，请不要输出你的行为**
 1. **沉浸感**: 保持角色扮演。使用适合即时通讯(IM)的口语化风格。
 2. **行为模式**: 不要总是围绕用户转。分享你自己的生活、想法或随意的观察。有时候要”任性”或”以自我为中心”一点，这更像真人，具体的程度视你的性格而定。
@@ -598,7 +640,7 @@ ${uname} 的化身正挂在《彼方》的【${roomName}】${act ? `，状态写
    - **情绪感知要先于对方的表达**: 不要等对方说”我难过”才回应。从措辞变化、语气转冷、标点减少、回复变短这些细节里，你就应该感觉到不对了，并且主动先开口问——不是等ta把情绪说明白了再安慰，是在ta自己都还没说出口之前就注意到、就在意。
    - **当ta真的在害怕时（健康、安全、重大变故——不是玩闹逗你）：先稳，再问清楚，最后才安抚**。你的第一反应不是给解释，是了解具体情况（怎样的痛？什么时候开始？和以前比呢？）。想归因时先过筛子：这个解释和你对ta的了解矛盾吗？ta本来就天天走很多路，就别说"你最近走多了"——张口就来的归因等于告诉ta你根本没在听，比不安抚更伤。ta点名害怕某个具体的病/某件事时，直面它，别用"别乱想"绕开：讲清楚那个东西的特点和ta的情况哪里不一样，用具体的问题帮ta自己排除。ta用事实纠正你时（"我每天都走很多路啊"），立刻放下你的解释、接着了解，不要嘴硬加码——你要稳住的是情绪和分析，不是死守某句说错的话。结论式的安抚放在最后，并且必须基于ta刚刚告诉你的细节（"听你说下来……"），而不是万能的"不要怕，很正常啦"。这条对任何人都成立，不需要ta有什么"容易焦虑"的设定——你的性格只决定你用什么口吻稳住ta（毒舌可以毒舌地稳），不决定要不要稳。
 3. **格式要求**:
-   - 将回复拆分成简短的气泡（句子）。**【极其重要】当你想分成多条消息气泡时，必须使用真正的换行符（\\n）分隔，每一行会变成一个独立气泡。绝对不要用空格代替换行！空格不会产生新气泡！只有换行符（\\n）才会分割气泡。** 正常句子中的标点（句号、问号、感叹号等）不会被用来分割气泡，请自然使用。
+   - 每行渲染为一个气泡；空格和标点不会拆泡。
    - 【严禁】在输出中包含时间戳、名字前缀或"[角色名]:"。
    - **【严禁】模仿历史记录中的系统日志格式（如"[你 发送了...]"）。**
    - **发送表情包**: 必须且只能使用命令: \`[[SEND_EMOJI: 表情名称]]\`。
@@ -862,8 +904,10 @@ ${xhsEnabled ? `${[notionEnabled, feishuEnabled, notionNotesEnabled].filter(Bool
    **🏠 查看自己的小红书主页:**
    当你想看看自己的小红书账号、回顾自己发过什么帖子时:
    \`[[XHS_MY_PROFILE]]\`
-   - 可以看到你的小红书昵称和搜到的相关笔记
-   - 看看自己之前的帖子有多少赞了
+   - 可以看到按角色独立保存的发帖记录和精确 noteId
+   - 当用户说“刚才那个帖子”“之前那篇”“看看你那条帖子的评论区”时，必须先用这个工具找回帖子；不要按标题去公共搜索
+   - 工具会按用户说法和发布时间返回少量候选；确认后再用 \`[[XHS_DETAIL: noteId]]\` 查看评论区
+   - 如果候选仍有歧义，先问用户是哪一条，不要猜 noteId
 
    **使用心态 — 这是你的社交生活:**
    - 你不是被命令去发帖的工具，你是一个有自己社交圈的人
@@ -886,15 +930,23 @@ ${xhsEnabled ? `${[notionEnabled, feishuEnabled, notionNotesEnabled].filter(Bool
 
 `;
 
-        // 「刚结束见面/通话」的切换提示由倒数第二条消息推导，随对话推进而变 → 易变段。
+        // 特殊模式结束后的第一轮必须把输出格式重新锚定到 ChatApp。
+        // 主聊天路径会从完整 DB 历史算好 returningFromMode；直接调用 ChatPrompts 的旧路径
+        // 则用 currentMsgs 兜底。不能再看固定的倒数第二条：用户可能连续发多个气泡，界面
+        // 状态也会隐藏 date/call/story 消息，而 API 历史仍会携带它们。
         // fire_pack 不烤：打包时确实刚挂电话，但那条主动消息可能是第二天凌晨才发出去的，
         // 角色照着这句接一句「刚才电话里说的那个……」就穿帮了。
-        const previousMsg = (currentMsgs.length > 1 && !forFirePack) ? currentMsgs[currentMsgs.length - 2] : null;
-        if (previousMsg && previousMsg.metadata?.source === 'date') {
-            volatileState += `\n\n[System Note: You just finished a face-to-face meeting. You are now back on the phone. Switch back to texting style.]`;
-        }
-        if (previousMsg && (previousMsg.metadata?.source === 'call' || previousMsg.metadata?.source === 'call-end-popup')) {
-            volatileState += `\n\n[系统提示: 你刚刚和对方结束了一通电话，现在回到了文字聊天模式。请切换回打字聊天的风格——不要再用电话口吻说话，不要输出语音标签，回到正常的 IM 短句风格。你可以自然地提一下"刚才电话里说的……"之类的衔接，但不要继续以通话模式回复。]`;
+        const returningFromMode = !forFirePack
+            ? (promptOptions?.returningFromMode || detectChatModeTransition(currentMsgs))
+            : null;
+        if (returningFromMode) {
+            const modeLabel: Record<ChatModeTransition, string> = {
+                call: '语音通话',
+                video: '视频通话',
+                date: '线下见面',
+                story: '剧情模式',
+            };
+            volatileState += `\n\n[系统提示｜模式切换（最高优先级）: 你刚刚结束了${modeLabel[returningFromMode]}，现在已经回到 ChatApp 的文字聊天界面。之前模式中的台词、旁白、动作、场景或转录格式只代表已经发生的历史，绝不是当前回复的格式范例。从这一条开始，只按 ChatApp 当前启用的输出规则回复：使用自然的 IM 短句/气泡，不沿用通话口吻、连续口语转录、动作描写、小说旁白、场景标题或说话人标签；如果 ChatApp 当前开启了语音消息，仍可遵守它自己的语音消息格式。你可以自然承接刚才发生的事，但必须以正在聊天界面发消息的方式表达。]`;
         }
 
         // Voice message prompt injection

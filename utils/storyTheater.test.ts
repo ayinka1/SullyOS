@@ -21,10 +21,13 @@ import {
     createBlankStoryPreset,
     createStoryTheaterDraft,
     dedupeTheaterWorldbooks,
+    describeEmptyStoryCompletion,
+    describeStoryApiError,
     getStoryPresetPromptGroups,
     getActiveStoryMiniTheaterPrompt,
     getPendingStoryRetryInput,
     isProtectedStoryPrompt,
+    isStoryUserLastCompatibilityError,
     memoryTimestampForCharacter,
     parseStoryDisplayBlocks,
     parseStoryMiniTheater,
@@ -37,7 +40,53 @@ import {
     selectStoryArchiveBatch,
     storyTheaterMemoryRecipientIds,
     formatActorRecentMessages,
+    formatStoryTheaterExport,
+    makeStoryTheaterFileName,
 } from './storyTheater';
+
+describe('剧情接口报错诊断', () => {
+    it('保留上游 400 的具体原因', () => {
+        expect(describeStoryApiError(400, { error: { message: 'context_length_exceeded: maximum 32768' } }))
+            .toBe('API Error 400：context_length_exceeded: maximum 32768');
+        expect(describeStoryApiError(400, { error: '最后一条消息必须是 user' }))
+            .toBe('API Error 400：最后一条消息必须是 user');
+    });
+
+    it('只在上游明确拒绝末条角色时建议 400 兼容模式', () => {
+        expect(isStoryUserLastCompatibilityError('API Error 400: final message role must be user')).toBe(true);
+        expect(isStoryUserLastCompatibilityError('API Error 400：最后一条消息必须是 user')).toBe(true);
+        expect(isStoryUserLastCompatibilityError('API Error 400: context_length_exceeded')).toBe(false);
+    });
+
+    it('空正文会暴露 finish_reason，而不是统一叫用户盲目重试', () => {
+        expect(describeEmptyStoryCompletion({ choices: [{ finish_reason: 'length', message: { content: '' } }] }))
+            .toContain('已用完输出额度');
+        expect(describeEmptyStoryCompletion({ choices: [{ finish_reason: 'content_filter', message: { content: '' } }] }))
+            .toContain('内容过滤');
+        expect(describeEmptyStoryCompletion({ choices: [{ finish_reason: 'stop', message: { content: '' } }] }))
+            .toContain('finish_reason=stop');
+    });
+});
+
+describe('剧情原文导出', () => {
+    it('按原始楼层顺序导出真实陪伴的完整推进与正文', () => {
+        const output = formatStoryTheaterExport(
+            { title: '雨夜', premise: '从车站开始', writesToCharacterMemory: true },
+            '条条',
+            ['林星', 'Noir'],
+            [
+                { id: 2, charId: 'story', role: 'assistant', type: 'text', content: '<story_text>他撑开伞。</story_text>', timestamp: 2 },
+                { id: 1, charId: 'story', role: 'user', type: 'text', content: '走出车站。', timestamp: 1 },
+            ] as Message[],
+            new Date(2026, 7, 13, 20, 0, 0).getTime(),
+        );
+
+        expect(output).toContain('模式：真实时间陪伴');
+        expect(output).toContain('角色：林星、Noir');
+        expect(output.indexOf('走出车站。')).toBeLessThan(output.indexOf('<story_text>他撑开伞。</story_text>'));
+        expect(makeStoryTheaterFileName('雨/夜', new Date(2026, 7, 13).getTime())).toBe('雨_夜_剧情记录_2026-08-13.txt');
+    });
+});
 
 describe('多人剧情记忆的人称与归属', () => {
     it('把每位角色的召回包进具名专属信封，并阻止把“你”重绑定到面具', () => {

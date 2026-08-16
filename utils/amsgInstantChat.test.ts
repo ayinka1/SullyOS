@@ -26,6 +26,19 @@ vi.mock('./keepAlive', () => ({
   KeepAlive: { init: vi.fn().mockResolvedValue(undefined), reregister: vi.fn().mockResolvedValue(undefined) },
 }));
 
+// 后台任务结果的分发口：真的那份会动态 import 记忆宫殿那一整套（IndexedDB），
+// 这里只关心「补收有没有把它交出去、销账判断对不对」。
+const { resultDispatch } = vi.hoisted(() => ({
+  resultDispatch: { calls: [] as unknown[], contexts: [] as unknown[], settle: true },
+}));
+vi.mock('./amsgResults', () => ({
+  dispatchAmsgResult: vi.fn(async (payload: unknown, context?: unknown) => {
+    resultDispatch.calls.push(payload);
+    resultDispatch.contexts.push(context);
+    return resultDispatch.settle;
+  }),
+}));
+
 const { storeState } = vi.hoisted(() => ({
   storeState: {
     config: {
@@ -70,9 +83,11 @@ import {
   getInstantChatPending,
   getStagedInstantChatExpiredNotices,
   isInstantChatReady,
+  resetInstantChatReprobeCooldown,
   resolveInstantChatReadiness,
   sendInstantChatTurn,
   setInstantChatPending,
+  settleInstantChatApiLog,
   settleInstantChatExpiredNotices,
   stageInstantChatExpiredNotices,
 } from './amsgInstantChat';
@@ -452,6 +467,114 @@ describe('只有 202 才算发出去', () => {
   });
 });
 
+// 「API 调用记录」的记录点挂在全局 fetch 拦截器上，只认 /chat/completions——上云这一轮
+// 本地只发一个 POST 给自己的 Worker，那条拦不到。不专门记的话，开了即时对话之后聊天
+// 在记录里整个消失，看着像调用凭空没了。
+describe('上云的这一轮也进「API 调用记录」', () => {
+  /** 收走写库的那几笔（apiCallLog 走动态 import('./db')，按 DB 单例打桩拦得到）。 */
+  const captureLog = () => {
+    const logged: any[] = [];
+    vi.spyOn(DB, 'appendApiCallLog').mockImplementation(async (entry: any) => { logged.push(entry); });
+    return logged;
+  };
+
+  const sendOnce = async (status: number, body: unknown) => {
+    stubFirePackDeps();
+    mockInstantChatFetch(status, body);
+    const logged = captureLog();
+    await sendInstantChatTurn({
+      char: CHAR, chatMessages: [{ role: 'user', content: '在吗' }], api: API,
+      userProfile: USER, groups: [], realtimeConfig: {} as any,
+    });
+    await vi.waitFor(() => expect(logged).toHaveLength(1));
+    return logged[0];
+  };
+
+  it('202 → 落一笔标着云端的「生成中」记录', async () => {
+    const entry = await sendOnce(202, { status: 'accepted', uuid: 'uuid-log' });
+    expect(entry).toMatchObject({
+      id: 'cloud-uuid-log',
+      route: 'cloud-instant-chat',
+      pending: true,
+      ok: true,
+      baseUrl: API.baseUrl,
+      model: API.model,
+      appName: '消息',
+      charId: CHAR.id,
+      charName: CHAR.name,
+      // 跟本地生成那条路同一个词，两条路在列表里对得起来。
+      purpose: '聊天回复',
+    });
+    // 输入构成照算：这一轮到底交上去多大的东西，本地就这一份线索。
+    expect(entry.promptBreakdown?.length).toBeGreaterThan(0);
+  });
+
+  it('连 202 都没拿到 → 记一笔当场就是终态的失败，不留「生成中」挂着', async () => {
+    const entry = await sendOnce(500, { success: false, error: { code: 'X', message: '云端挂了' } });
+    expect(entry).toMatchObject({ route: 'cloud-instant-chat', pending: false, ok: false });
+    expect(entry.promptBreakdown?.length).toBeGreaterThan(0);
+  });
+
+  it('还没等到回复就又发一条 → 上一笔收成「已顶替」，不会一直转圈到被裁掉', async () => {
+    stubFirePackDeps();
+    mockInstantChatFetch(202, { status: 'accepted', uuid: 'uuid-second' });
+    setInstantChatPending(CHAR.id, 'uuid-first', 1_000);
+    const logged = captureLog();
+    await sendInstantChatTurn({
+      char: CHAR, chatMessages: [{ role: 'user', content: '还在吗' }], api: API,
+      userProfile: USER, groups: [], realtimeConfig: {} as any,
+    });
+    await vi.waitFor(() => expect(logged).toHaveLength(2));
+    // 顶掉的那一轮不算失败：云端把两句合成一次回，只是它不再单独等回复了。
+    expect(logged.find((e) => e.id === 'cloud-uuid-first')).toMatchObject({
+      pending: false, superseded: true, ok: true,
+    });
+    expect(logged.find((e) => e.id === 'cloud-uuid-second')?.pending).toBe(true);
+  });
+
+  it('回复回来 → 同一条记录补上用量，时间戳一个字不动（列表顺序不许跟着回复先后跳）', async () => {
+    const logged = captureLog();
+    settleInstantChatApiLog('uuid-log', { amsgUsage: { promptTokens: 1200, completionTokens: 80 } });
+    await vi.waitFor(() => expect(logged).toHaveLength(1));
+    expect(logged[0]).toMatchObject({
+      id: 'cloud-uuid-log', pending: false, ok: true,
+      promptTokens: 1200, completionTokens: 80,
+      // 云端只报入和出，总数本地自己加——列表顶上的合计读的就是它。
+      totalTokens: 1280,
+    });
+    expect(logged[0].timestamp).toBeUndefined();
+    expect(logged[0].tokensPartial).toBeUndefined();
+  });
+
+  it('这一轮调过工具 → 用量标成只算末轮（云端只报得回最后一次调用的数）', async () => {
+    const logged = captureLog();
+    settleInstantChatApiLog('uuid-log', {
+      amsgUsage: { promptTokens: 1200, completionTokens: 80 },
+      amsgToolTrace: [{ name: 'web_search', count: 1 }],
+    });
+    await vi.waitFor(() => expect(logged).toHaveLength(1));
+    expect(logged[0].tokensPartial).toBe(true);
+  });
+
+  it('云端没回用量 → 只销「生成中」，不往记录里填 0 冒充真数', async () => {
+    const logged = captureLog();
+    settleInstantChatApiLog('uuid-log', {});
+    await vi.waitFor(() => expect(logged).toHaveLength(1));
+    expect(logged[0].pending).toBe(false);
+    expect(logged[0].promptTokens).toBeUndefined();
+    expect(logged[0].totalTokens).toBeUndefined();
+  });
+
+  it('云端点名说这一轮没成 → 那笔跟着收尾成失败，不会一直写着「生成中」', async () => {
+    setInstantChatPending(CHAR.id, 'uuid-dead', 1_000);
+    vi.spyOn(DB, 'saveMessage').mockResolvedValue(undefined as any);
+    const logged = captureLog();
+    await failInstantChatPending(CHAR.id, 'uuid-dead', '云端生成失败');
+    await vi.waitFor(() => expect(logged).toHaveLength(1));
+    expect(logged[0]).toMatchObject({ id: 'cloud-uuid-dead', pending: false, ok: false });
+  });
+});
+
 describe('待收记录（「正在输入…」那盏灯的唯一依据）', () => {
   it('落在 localStorage 里，重启后还在', () => {
     setInstantChatPending('char-a', 'uuid-a', 1_000);
@@ -553,8 +676,22 @@ describe('开关', () => {
   // 新 bundle 少了起跳器直接 503。用户开着开关也得让位给本地生成，否则他对着
   // 「正在输入…」等一条永远不来的回复，而设置页写着「已开启」。
 
-  it('探到 Worker 跑不动 → 用户开着也不走云端（reason worker-outdated）', async () => {
+  // 存量是粘的（只有探测成功才翻得回来），所以让位之前一定要先现探一次——下面四条钉的
+  // 就是这次现探的四种去向。
+
+  /** 存量说跑不动 + 摆好「这次现探会问到什么」。 */
+  const stageOutdatedWithProbe = (outcome: 'supported' | 'unsupported' | 'unknown') => {
     storeState.config = { ...storeState.config, instantChatEnabled: true, instantChatSupported: false };
+    // 冷却是模块级状态，会串到别的用例上去。
+    resetInstantChatReprobeCooldown();
+    return vi.spyOn(ActiveMsgClient, 'probeInstantChatSupportDetailed').mockResolvedValue({
+      outcome,
+      supported: outcome === 'supported' ? true : outcome === 'unsupported' ? false : undefined,
+    });
+  };
+
+  it('现探确认跑不动 → 用户开着也不走云端（reason worker-outdated）', async () => {
+    stageOutdatedWithProbe('unsupported');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* 静音，只数次数 */ });
     const readiness = await resolveInstantChatReadiness();
     expect(readiness).toEqual({ ready: false, reason: 'worker-outdated' });
@@ -563,6 +700,35 @@ describe('开关', () => {
     expect(readiness.reason).not.toBe('disabled');
     // 静默让位正是「静默分流」那个坑，必须留声。
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  // ★ 这条是「一次抖动 ≠ 长期降级」的守卫。
+  // 从前存量一旦是 false 就直接判死，而写下这个 false 的可能只是一次网络抖动——用户不
+  // 碰巧打开设置页就一直卡在本地生成（线上真实故障：Worker 全绿，用户连着几小时全走本地，
+  // 而他的本地直连根本不通）。现在发消息路上会现探一次，好了立刻回到云端。
+  it('存量说跑不动、现探却发现已经好了 → 这一轮就回到云端（不必等用户去开设置页）', async () => {
+    stageOutdatedWithProbe('supported');
+    expect(await resolveInstantChatReadiness()).toEqual({ ready: true });
+  });
+
+  // 够不着云端时不能指人去「更新 Worker」：他多半点不动，而且问题也不在那儿。
+  it('现探够不着云端 → 单独一档 worker-unreachable，不叫人去更新 Worker', async () => {
+    stageOutdatedWithProbe('unknown');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* 静音，只数次数 */ });
+    const readiness = await resolveInstantChatReadiness();
+    expect(readiness).toEqual({ ready: false, reason: 'worker-unreachable' });
+    expect(readiness.reason).not.toBe('worker-outdated');
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  // 现探是加在发消息路上的，连发几条消息不能变成一串 /config-check。
+  it('冷却期内不重复现探（连发三条只探一次）', async () => {
+    const probe = stageOutdatedWithProbe('unsupported');
+    vi.spyOn(console, 'warn').mockImplementation(() => { /* 静音 */ });
+    await resolveInstantChatReadiness();
+    await resolveInstantChatReadiness();
+    await resolveInstantChatReadiness();
+    expect(probe).toHaveBeenCalledTimes(1);
   });
 
   it('没探过（undefined）→ 放行：不知道 ≠ 知道它不行', async () => {
@@ -767,6 +933,60 @@ describe('推送丢了的补收（服务端账本）', () => {
     expect(ackNow).toEqual([messageId]);
   });
 
+  // 后台任务（门牌整理这类）跑完送回来的结果**只走这条路**：不弹通知的结果上游只落
+  // 账本、不发推送，所以补收是它唯一的入口。跟 reasoning/error 那批一起当场销账丢掉的
+  // 话，云端跑完的东西会一声不响地全部蒸发——面板全绿、日志干净、就是东西没了。
+  describe('后台任务的结果（messageKind: result）', () => {
+    beforeEach(() => {
+      resultDispatch.calls = [];
+      resultDispatch.contexts = [];
+      resultDispatch.settle = true;
+    });
+
+    it('交给分发口，不写进聊天流', async () => {
+      const messageId = 'msg-result';
+      const push = outboxPush(messageId, {
+        messageKind: 'result',
+        resultKind: 'plate-consolidate',
+        message: undefined,
+        items: [{ room: 'user_room', text: '小明搬去合租了' }],
+      });
+      stubOutbox([entry(messageId, push)]);
+      const { written, ackNow } = await drainOutbox();
+
+      expect(written).toBe(0);
+      expect(storeState.saved).toHaveLength(0);
+      expect(resultDispatch.calls).toEqual([push]);
+      expect(ackNow).toEqual([messageId]);
+    });
+
+    it('消化失败就不销账，下次上线再拉回来', async () => {
+      resultDispatch.settle = false;
+      const messageId = 'msg-result-retry';
+      stubOutbox([entry(messageId, outboxPush(messageId, {
+        messageKind: 'result', resultKind: 'plate-consolidate',
+      }))]);
+      const { ackNow } = await drainOutbox();
+      expect(ackNow).toEqual([]);
+    });
+
+    // 回归守卫：这条路刻意跳过了聊天那 24 小时的时效窗（结果晚到本来就是常态），可跳过
+    // 之后没换上任何上限。账本留 28 天——重装 PWA 的用户第一次接上账本会把一个月前的结果
+    // 一次性拉回来。这里不替各种产物定规矩，但账本上记的时间必须原样交出去，认领它的
+    // 那一方才判得了「陈到不能用了没有」。
+    it('时效窗那道判断不套在结果上，但账本上记的时间要交出去', async () => {
+      const messageId = 'msg-result-old';
+      const tooOld = Date.now() - OUTBOX_BACKFILL_MAX_AGE_MS - 1;
+      stubOutbox([entry(messageId, outboxPush(messageId, {
+        messageKind: 'result', resultKind: 'plate-consolidate',
+      }), tooOld)]);
+      await drainOutbox();
+      expect(resultDispatch.calls).toHaveLength(1);
+      expect(resultDispatch.contexts[0], '不交时间的话它连「这份躺了多久」都问不出来')
+        .toEqual({ createdAt: tooOld });
+    });
+  });
+
   it('情绪结果显式标成 emotion_update（冲刷管线靠它分流，认不出会当正文气泡渲染）', async () => {
     const messageId = 'msg-emotion';
     stubOutbox([entry(messageId, outboxPush(messageId, {
@@ -885,6 +1105,28 @@ describe('第一次接上服务端账本', () => {
     expect(ack).toHaveBeenCalledWith(['m-old']);
   });
 
+  // 回归守卫：换设备 / 重装 PWA / 清过 localStorage 的用户，启动第一趟走的就是这条路。
+  // 后台任务的结果不进聊天流，没有「存量重放刷屏」这回事，而补收是它唯一的入口（不弹
+  // 通知的结果上游只落账本、不发推送）。跟存量一起销掉的话，云端已经跑完的门牌整理会
+  // 一声不响地蒸发，面板全绿、日志干净、就是东西没了。
+  it('后台任务的结果不算存量，照常交给分发口', async () => {
+    resultDispatch.calls = [];
+    resultDispatch.settle = true;
+    const resultEntry = {
+      ...entry('m-result', 'uuid-job'),
+      push: { messageKind: 'result', resultKind: 'plate-consolidate', messageId: 'm-result' },
+    };
+    stubOutboxOnce([entry('m-old', 'uuid-old'), resultEntry]);
+    const ack = vi.spyOn(ActiveMsgClient, 'ackOutboxMessages').mockResolvedValue(undefined);
+
+    const { ackNow } = await drainOutbox();
+
+    expect(ack, '结果不在整批销账那一批里').toHaveBeenCalledWith(['m-old']);
+    expect(resultDispatch.calls).toHaveLength(1);
+    expect(ackNow, '消化成功之后才销它自己那一条').toEqual(['m-result']);
+    expect(localStorage.getItem(AMSG_OUTBOX_ADOPTED_LS_KEY)).toBeTruthy();
+  });
+
   // 先记标记再销账的话，销账一失败，剩下的存量下一趟就会被当成补收倒进聊天流。
   it('存量没销干净 → 不记标记，下一趟重新接管', async () => {
     stubOutboxOnce([entry('m1', 'uuid-1')]);
@@ -909,5 +1151,22 @@ describe('第一次接上服务端账本', () => {
 
     expect(written).toBe(1);
     expect(storeState.saved.map((m: any) => m.messageId)).toEqual(['m-new']);
+  });
+
+  // 自动路径把存量整批销掉是对的（分不清哪些是真丢的），但对「我确实少收了消息」的
+  // 用户来说，那批存量恰恰就是他要找的东西——销了就再也拿不回来了。所以手动补收
+  // 这条路要能越过接管：用户自己知道自己丢了，这个判断他做得了。
+  it('手动补收越过首次接管，存量照样上屏', async () => {
+    stubOutboxOnce([entry('m-missed', 'uuid-missed')]);
+    const ack = vi.spyOn(ActiveMsgClient, 'ackOutboxMessages').mockResolvedValue(undefined);
+
+    const { written } = await drainOutbox({ treatBacklogAsMissed: true });
+
+    expect(written).toBe(1);
+    expect(storeState.saved.map((m: any) => m.messageId)).toEqual(['m-missed']);
+    // 没被当存量销掉：销账要等落库走完那一步（backfill 里 written 的那条不进 ackNow）。
+    expect(ack).not.toHaveBeenCalledWith(['m-missed']);
+    // 手动补过一次就算接上了，后面回到自动路径，别下次又把新条目当存量销掉。
+    expect(localStorage.getItem(AMSG_OUTBOX_ADOPTED_LS_KEY)).toBeTruthy();
   });
 });

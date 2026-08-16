@@ -45,13 +45,14 @@ import { getLastRealUserMessageAt } from '../utils/amsg2ExpireGuard';
 import { getPendingTasks, hasActiveAiTask, isAmsg2EnabledForChar } from '../utils/amsg2Tasks';
 import { buildAmsg2NoticesText, buildAmsg2TaskContextText, collectAmsg2TaskContext } from '../utils/amsg2TaskContext';
 import { resolveCharTimeZone } from '../utils/timezone';
-import { getInstantChatPending, resolveInstantChatReadiness, sendInstantChatTurn, stageInstantChatExpiredNotices } from '../utils/amsgInstantChat';
+import { announceInstantChatRoute, getInstantChatPending, resolveInstantChatReadiness, sendInstantChatTurn, stageInstantChatExpiredNotices } from '../utils/amsgInstantChat';
 // worker 模块的常量叶子（零运行时依赖，前端引它不带进 worker 环境）：
 // 云端 fire 的总时长上限，安全网超时从它推导，worker 调预算时前端自动跟上。
 import { INSTANT_TOTAL_TIMEOUT_MS } from '../worker/amsg/src/instantChat';
 import { appendInstantTraceEntry } from '../utils/instantTraceLog';
 import { AMSG2_TOOLS, AMSG2_TOOL_NAMES, createAmsg2ToolSession, executeAmsg2Tool, isAmsg2GlobalReady } from '../utils/amsg2ToolBridge';
 import { shouldSendThinkingParams } from '../utils/thinkingGate';
+import { buildClaudeProxyCompatibilityBody, shouldRetryClaudeProxyCompatibility } from '../utils/claudeProxyCompat';
 import { routeMiniAppToolCall } from '../utils/miniAppToolRoute';
 import { applyEmotionEvalRaw, extractAssistantText } from '../utils/emotionApply';
 import { announceChatGen, CHAT_GEN_EVENTS } from '../utils/chatGenEvents';
@@ -873,16 +874,21 @@ export const useChatAI = ({
                     charId: char.id,
                     reason: skipReason,
                 });
-            } else if (instantChatReadiness.reason === 'worker-outdated') {
-                // 用户把开关开着，是我们判定那台 Worker 跑不动才让位给本地生成的
+            } else if (instantChatReadiness.reason === 'worker-outdated' || instantChatReadiness.reason === 'worker-unreachable') {
+                // 用户把开关开着，是我们判定这一轮上不了云才让位给本地生成的
                 // （见 resolveInstantChatReadiness 的同名门）。上面那条 trace 的条件
                 // （instantChatOn）在这里天然为假，所以单独留一条：这一档比别的更需要
                 // 查得到——用户的主观意愿是「上云」，实际走的却是本地，不留痕就又是一次
                 // 静默分流。拦不拦不用这里管，readiness 已经说了 not ready，
                 // 下面照常走本地生成那条路。
+                //
+                // 两档分开记：worker-outdated 是「问到了、那台 Worker 确实跑不动」（该去更新），
+                // worker-unreachable 是「这一刻够不着云端」（多半是网络，会自己好）。
                 appendInstantTraceEntry({
                     ts: new Date().toISOString(),
-                    event: 'instant-chat-worker-outdated',
+                    event: instantChatReadiness.reason === 'worker-outdated'
+                        ? 'instant-chat-worker-outdated'
+                        : 'instant-chat-worker-unreachable',
                     charId: char.id,
                 });
             } else if (instantChatReadiness.reason === 'config-unreadable') {
@@ -914,6 +920,14 @@ export const useChatAI = ({
                 }
                 console.warn('[AmsgInstantChat] 全局配置读不出来（开没开都不知道），但这一轮本就不走即时对话，照原路继续');
             }
+
+            // 这一轮到底走了哪条路，播给输入框上方那条小提示。**每轮都发**，包括走成了云端
+            // 那一轮（reason=null，提示自己收起来）——只在出问题时发的话，用户会一直盯着一条
+            // 早就过期的提示，猜不出来「现在到底恢复了没有」。
+            announceInstantChatRoute({
+                charId: char.id,
+                reason: instantChatRoute ? null : (instantChatReadiness.reason ?? null),
+            });
 
             const payload = await stageT('payload', buildChatRequestPayload({
                 char: charForGen, userProfile, groups, emojis, categories,
@@ -1454,12 +1468,38 @@ export const useChatAI = ({
                     body: JSON.stringify({ ...baseReqBody, messages: withAmsg2TaskContext(baseReqBody.messages) })
                 }, 2, 0, { appName: '消息', charId: char.id, charName: char.name, purpose: '聊天回复' }, streamHooks);
             } catch (e) {
+                let requestError: unknown = e;
+                const attemptedBody = {
+                    ...baseReqBody,
+                    messages: withAmsg2TaskContext(baseReqBody.messages),
+                };
+                // 部分第三方 OpenAI→Claude 中转会把请求形状不兼容包装成 502
+                // bad_response_status_code：thinking 三种方言、tools、尾部 system 单独都能收，
+                // 组合在一起却在上游适配层失败。只对这一条高度特征化的 502 降级一次：
+                // tools 和正文完整保留，system 合到开头，thinking 参数让步。普通网络 502、
+                // 非 Claude、没工具的请求一律不重发，避免无依据地重复计费。
+                if (shouldRetryClaudeProxyCompatibility(requestError, attemptedBody)) {
+                    console.warn('🧩 [Claude compat] 中转拒绝 thinking + tools 组合，使用兼容请求体重试一次');
+                    try {
+                        data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                            method: 'POST', headers,
+                            body: JSON.stringify(buildClaudeProxyCompatibilityBody(attemptedBody)),
+                        }, 0, 0, { appName: '消息', charId: char.id, charName: char.name, purpose: 'Claude 中转兼容重试' }, streamHooks);
+                        requestError = null;
+                    } catch (compatError) {
+                        requestError = compatError;
+                    }
+                }
+
+                if (!requestError) {
+                    // Claude 兼容重试已成功，继续走下方统一后处理。
+                } else {
                 // 仅通用 MCP、且没有和其他工具模式混用时降级。部分 OpenAI 兼容中转
                 // 会对携带 tools 的请求直接回 4xx，而不是忽略参数；去掉 tools 后让
                 // 现有正文假调用容错接手。真实鉴权失败会在这次重试中再次抛出原样错误。
                 const mcpOnly = payload.flags.mcpChatActive
                     && !payload.flags.luckinChatActive && !payload.flags.mcdActive && !payload.flags.luckinActive;
-                if (!mcpOnly || !baseReqBody.tools?.length || !shouldRetryMcpWithoutTools(e)) throw e;
+                if (!mcpOnly || !baseReqBody.tools?.length || !shouldRetryMcpWithoutTools(requestError)) throw requestError;
                 console.warn('🔌 [MCP] 当前中转拒绝 tools 请求，降级为正文工具调用兼容模式');
                 // 这条路把 tools 全删了，角色排不了新任务；排程现状照样要带——它得知道
                 // 自己名下已经有哪些承诺，否则又会在正文里许一遍。
@@ -1471,6 +1511,7 @@ export const useChatAI = ({
                     method: 'POST', headers,
                     body: JSON.stringify(fallbackBody)
                 }, 0, 0, { appName: '消息', charId: char.id, charName: char.name, purpose: 'MCP tools 兼容重试' });
+                }
             }
             console.log(`⏱ [API call] ${Math.round(performance.now() - apiT0)}ms`);
             updateTokenUsage(data, historyMsgCount, 'initial');
@@ -1934,6 +1975,7 @@ export const useChatAI = ({
                 userProfile,
                 emojis,
                 realtimeConfig,
+                groups,
                 contextMsgs,
                 fullMessages,
                 initialData: data,

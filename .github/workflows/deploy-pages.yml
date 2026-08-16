@@ -44,6 +44,10 @@ jobs:
 
       - name: Build
         run: pnpm run build
+        env:
+          # 非 master 分支构建默认会显示右下角 build badge + 调试钳子浮球；
+          # fork 部署到 Pages 时强制隐藏，避免终端用户看到开发期 UI。
+          VITE_HIDE_BUILD_BADGE: '1'
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

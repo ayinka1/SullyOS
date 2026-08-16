@@ -15,6 +15,7 @@ import { FISH_VOICE_ACTING_GUIDE } from './fishAudioTts';
 import { getTtsProvider, getVoicePromptOverride } from './ttsProvider';
 import { resolveCharTimeZone, nowInTimeZone } from './timezone';
 import { buildLifeRecordInjection } from './lifeRecords';
+import { buildMemoInjection } from './memoInjection';
 import { isWorkerReachableUrl } from './amsgToolPack';
 import { isAmsg2EnabledForChar } from './amsg2Tasks';
 import { getCharNameById } from './charNameRegistry';
@@ -446,7 +447,16 @@ ${groupLogStr}\n`;
                 return '';
             });
 
-        const [realtimeText, schedule, groupContextText, notionDiaryText, feishuDiaryText, notionNotesText, lifeRecordText] =
+        // 8. 备忘录注入 — 角色勾选启用时注入列表（+ 私聊场景的工具说明）。
+        //    fire_pack 只注入列表不注入工具说明（后台不该操作备忘）。
+        //    门控：char.memoEnabled !== true 时 buildMemoInjection 返回 ''。
+        const memoPromise: Promise<string> = buildMemoInjection(char, { forFirePack })
+            .catch(e => {
+                console.error('Failed to inject memo context:', e);
+                return '';
+            });
+
+        const [realtimeText, schedule, groupContextText, notionDiaryText, feishuDiaryText, notionNotesText, lifeRecordText, memoText] =
             await Promise.all([
                 timed('realtime', realtimePromise),
                 timed('schedule', schedulePromise),
@@ -455,6 +465,7 @@ ${groupLogStr}\n`;
                 timed('feishuDiary', feishuDiaryPromise),
                 timed('notionNotes', notionNotesPromise),
                 timed('lifeRecord', lifeRecordPromise),
+                timed('memo', memoPromise),
             ]);
 
         // ── 拼接：易变的进 volatileState，稳定的进 baseSystemPrompt ──
@@ -523,6 +534,8 @@ ${groupLogStr}\n`;
         baseSystemPrompt += feishuDiaryText;
         baseSystemPrompt += notionNotesText;
         baseSystemPrompt += lifeRecordText;
+        // 备忘录：稳定段（备忘内容变化慢，且工具说明是常驻的）。门控在 buildMemoInjection 里。
+        baseSystemPrompt += memoText;
 
         // 彼方常驻设定：仅对启用了「彼方」的角色注入。让角色在聊天里始终知道彼方是什么，
         // 不再依赖累积的 vr_card 动态 / 记忆总结（那些会被压缩、丢掉"彼方=VR游戏"的框定，

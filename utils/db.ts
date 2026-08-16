@@ -9,7 +9,8 @@ import {
     LifeSimState, HandbookEntry, Tracker, TrackerEntry, HotNewsSnapshot,
     LifeRecord, MedPlan, LifeRecordSettings, CharacterGroup,
     VRWorldNovel, VRNovelAnnotation, CustomCreatorPart, VRMusicRoomState, VRGuestbookState, VRScript, VRStagedPlay, VRLetter,
-    WorldProfile, WorldEpisode, StoryTheaterEntry, StoryTheaterPreset, StoryTheaterMask
+    WorldProfile, WorldEpisode, StoryTheaterEntry, StoryTheaterPreset, StoryTheaterMask,
+    Memo, DeletedMemo,
 } from '../types';
 import { exportPostOfficeLocal, importPostOfficeLocal } from './vrWorld/postOffice';
 import { exportSignalLocal, importSignalLocal } from './vrWorld/signal';
@@ -83,6 +84,17 @@ const STORE_LIFE_SETTINGS = 'life_record_settings'; // 生活记录设置单例�
 const STORE_STORY_THEATERS = 'story_theaters';       // 见面·剧情条目（消息用 story-theater:${id}）
 const STORE_STORY_THEATER_PRESETS = 'story_theater_presets'; // 糯米机原生剧情预设
 const STORE_STORY_THEATER_MASKS = 'story_theater_masks'; // 剧场原创人物面具
+
+// 备忘录 (Memo) — per-char 私人备忘。memos 是活表，deleted_memos 是软删回收站。
+// 18 天后由 purgeExpiredDeletedMemos 硬删，期间可恢复 / 手动硬删。
+// 角色删除时由 deleteCharacter 级联清空这两张表（按 charId 索引）。
+const STORE_MEMOS = 'memos';
+const STORE_DELETED_MEMOS = 'deleted_memos';
+
+// 回收站保留期：18 天后硬删（用户手动恢复 / 硬删不在此限）。
+// 选 18 天：够长能找回手滑，够短不至于把"已删"当"还在"——用户问"我删过吗"时不会被
+// 一堆半年前的条目误导。也跟项目里其他软删（如聊天记录隐藏水位）的尺度接近。
+const MEMO_PURGE_DAYS = 18;
 
 // API 调用记录：保留近 5 天，超期丢弃；再加一个硬上限防止异常情况撑爆
 const API_CALL_LOG_MAX_AGE_MS = 5 * 24 * 60 * 60 * 1000;
@@ -347,6 +359,16 @@ export const openDB = (): Promise<IDBDatabase> => {
       createStore(STORE_STORY_THEATER_PRESETS, { keyPath: 'id' });
       createStore(STORE_STORY_THEATER_MASKS, { keyPath: 'id' });
 
+      // 备忘录：活表 + 回收站，均按 charId 索引，便于角色删除级联清理
+      if (!db.objectStoreNames.contains(STORE_MEMOS)) {
+          const memoStore = db.createObjectStore(STORE_MEMOS, { keyPath: 'id' });
+          memoStore.createIndex('charId', 'charId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_DELETED_MEMOS)) {
+          const dmStore = db.createObjectStore(STORE_DELETED_MEMOS, { keyPath: 'id' });
+          dmStore.createIndex('charId', 'charId', { unique: false });
+      }
+
       createStore(STORE_HOTNEWS, { keyPath: 'id' });
 
       // ─── Memory Palace (记忆宫殿) stores ───
@@ -530,8 +552,28 @@ export const DB = {
 
   deleteCharacter: async (id: string): Promise<void> => {
     const db = await openDB();
-    const transaction = db.transaction(STORE_CHARACTERS, 'readwrite');
+    // 级联删除：角色删了，它的备忘 + 回收站条目一起清掉。
+    // memos / deleted_memos 都有 charId 索引，按索引删最稳。
+    // 不级联会留下一堆孤儿数据：角色已删但备忘还在，UI 进不去，DB 里也清不掉。
+    const storeNames = [STORE_CHARACTERS];
+    if (db.objectStoreNames.contains(STORE_MEMOS)) storeNames.push(STORE_MEMOS);
+    if (db.objectStoreNames.contains(STORE_DELETED_MEMOS)) storeNames.push(STORE_DELETED_MEMOS);
+    const transaction = db.transaction(storeNames, 'readwrite');
     transaction.objectStore(STORE_CHARACTERS).delete(id);
+    if (db.objectStoreNames.contains(STORE_MEMOS)) {
+        const idx = transaction.objectStore(STORE_MEMOS).index('charId');
+        idx.openCursor(IDBKeyRange.only(id)).onsuccess = (e) => {
+            const cursor = (e.target as IDBRequest<IDBCursorWithValue>).result;
+            if (cursor) { cursor.delete(); cursor.continue(); }
+        };
+    }
+    if (db.objectStoreNames.contains(STORE_DELETED_MEMOS)) {
+        const idx = transaction.objectStore(STORE_DELETED_MEMOS).index('charId');
+        idx.openCursor(IDBKeyRange.only(id)).onsuccess = (e) => {
+            const cursor = (e.target as IDBRequest<IDBCursorWithValue>).result;
+            if (cursor) { cursor.delete(); cursor.continue(); }
+        };
+    }
   },
 
   // ---- 角色分组（神经链接"文件夹"，与群聊 groups 无关）----
@@ -3593,5 +3635,179 @@ export const DB = {
           data.bankState = undefined as any;
           data.bankDollhouse = undefined as any;
       }, (data.bankState ? 1 : 0) + (data.bankDollhouse ? 1 : 0));
-  }
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // 备忘录 (Memo)
+  //
+  // 排序约定：所有返回数组的方法都按 updatedAt 倒序（最近修改的在前）。
+  // 上限：MEMO_MAX = 10，超上限的 create 由调用方（memoToolBridge / UI）拦住，
+  // 这里不强制——因为 DB 层不该知道业务上限，UI 和工具入口已经各自把关。
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** 取某角色的全部活备忘（按 updatedAt 倒序） */
+  getMemosByCharId: async (charId: string): Promise<Memo[]> => {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(STORE_MEMOS)) return [];
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_MEMOS, 'readonly');
+      const index = tx.objectStore(STORE_MEMOS).index('charId');
+      const req = index.getAll(IDBKeyRange.only(charId));
+      req.onsuccess = () => {
+        const list = (req.result || []) as Memo[];
+        list.sort((a, b) => b.updatedAt - a.updatedAt);
+        resolve(list);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  },
+
+  /** 新建 / 更新一条备忘（upsert）。updatedAt 由调用方写入。 */
+  saveMemo: async (memo: Memo): Promise<void> => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_MEMOS, 'readwrite');
+      tx.objectStore(STORE_MEMOS).put(memo);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('saveMemo aborted'));
+    });
+  },
+
+  /** 硬删一条活备忘（仅在工具调用 / UI 强删时用；普通删除走 softDeleteMemo） */
+  deleteMemo: async (id: string): Promise<void> => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_MEMOS, 'readwrite');
+      tx.objectStore(STORE_MEMOS).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+
+  /** 软删：把 memo 从 memos 移到 deleted_memos，加 deletedAt 时间戳。 */
+  softDeleteMemo: async (id: string): Promise<void> => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_MEMOS, STORE_DELETED_MEMOS], 'readwrite');
+      const getReq = tx.objectStore(STORE_MEMOS).get(id);
+      getReq.onsuccess = () => {
+        const memo = getReq.result as Memo | undefined;
+        if (!memo) { resolve(); return; } // 已经不在了，幂等
+        const deleted: DeletedMemo = {
+          id: memo.id,
+          charId: memo.charId,
+          type: memo.type,
+          content: memo.content,
+          tags: memo.tags,
+          done: memo.done,
+          createdAt: memo.createdAt,
+          updatedAt: memo.updatedAt,
+          deletedAt: Date.now(),
+        };
+        tx.objectStore(STORE_DELETED_MEMOS).put(deleted);
+        tx.objectStore(STORE_MEMOS).delete(id);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('softDeleteMemo aborted'));
+    });
+  },
+
+  /** 从回收站恢复一条到活表（沿用原 id / createdAt，updatedAt 保持不变） */
+  restoreMemo: async (id: string): Promise<void> => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_MEMOS, STORE_DELETED_MEMOS], 'readwrite');
+      const getReq = tx.objectStore(STORE_DELETED_MEMOS).get(id);
+      getReq.onsuccess = () => {
+        const deleted = getReq.result as DeletedMemo | undefined;
+        if (!deleted) { resolve(); return; }
+        const memo: Memo = {
+          id: deleted.id,
+          charId: deleted.charId,
+          type: deleted.type,
+          content: deleted.content,
+          tags: deleted.tags,
+          done: deleted.done,
+          createdAt: deleted.createdAt,
+          updatedAt: deleted.updatedAt,
+        };
+        tx.objectStore(STORE_MEMOS).put(memo);
+        tx.objectStore(STORE_DELETED_MEMOS).delete(id);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('restoreMemo aborted'));
+    });
+  },
+
+  /** 彻底删除回收站里的一条（手动硬删，立即不可恢复） */
+  purgeDeletedMemo: async (id: string): Promise<void> => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_DELETED_MEMOS, 'readwrite');
+      tx.objectStore(STORE_DELETED_MEMOS).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+
+  /** 取某角色的回收站条目（按 deletedAt 倒序，最近删的在最前） */
+  getDeletedMemosByCharId: async (charId: string): Promise<DeletedMemo[]> => {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(STORE_DELETED_MEMOS)) return [];
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_DELETED_MEMOS, 'readonly');
+      const index = tx.objectStore(STORE_DELETED_MEMOS).index('charId');
+      const req = index.getAll(IDBKeyRange.only(charId));
+      req.onsuccess = () => {
+        const list = (req.result || []) as DeletedMemo[];
+        list.sort((a, b) => b.deletedAt - a.deletedAt);
+        resolve(list);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  },
+
+  /** 取某角色的回收站条目（按 deletedAt 倒序，最近删的在最前） */
+  getAllDeletedMemos: async (): Promise<DeletedMemo[]> => {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(STORE_DELETED_MEMOS)) return [];
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_DELETED_MEMOS, 'readonly');
+      const req = tx.objectStore(STORE_DELETED_MEMOS).getAll();
+      req.onsuccess = () => {
+        const list = (req.result || []) as DeletedMemo[];
+        list.sort((a, b) => b.deletedAt - a.deletedAt);
+        resolve(list);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  },
+
+  /**
+   * 清理过期回收站条目：deletedAt + MEMO_PURGE_DAYS 天之前的一律硬删。
+   * 在 MemoApp 启动时调一次。返回清理条数（用于 toast 提示）。
+   */
+  purgeExpiredDeletedMemos: async (): Promise<number> => {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(STORE_DELETED_MEMOS)) return 0;
+    const cutoff = Date.now() - MEMO_PURGE_DAYS * 24 * 60 * 60 * 1000;
+    return new Promise((resolve, reject) => {
+      let count = 0;
+      const tx = db.transaction(STORE_DELETED_MEMOS, 'readwrite');
+      const req = tx.objectStore(STORE_DELETED_MEMOS).openCursor();
+      req.onsuccess = (e) => {
+        const cursor = (e.target as IDBRequest<IDBCursorWithValue>).result;
+        if (cursor) {
+          const item = cursor.value as DeletedMemo;
+          if (item.deletedAt < cutoff) { cursor.delete(); count++; }
+          cursor.continue();
+        }
+      };
+      tx.oncomplete = () => resolve(count);
+      tx.onerror = () => reject(tx.error);
+    });
+  },
 };

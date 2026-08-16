@@ -38,6 +38,7 @@ export enum AppID {
   VRWorld = 'vrworld', // 彼方 — 角色自主登入的虚拟世界（定时驱动，房间里看小说/听歌/留言，产出活动卡注入聊天+记忆）
   CharCreatorDev = 'char_creator_dev', // 捏脸系统开发模式 — 仅开发模式可见，向捏人器指定类目追加自定义部件
   WorldHome = 'world_home', // 家园 — 同世界观多角色共同生活的大世界（观测驱动演绎，每角色独立 LLM 调用 + NPC 世界引擎）
+  Memo = 'memo', // 备忘录 — per-char 私人备忘（日常/待办，TAG，软删回收站），私聊场景注入 + 工具调用
 }
 
 export interface SystemLog {
@@ -2842,6 +2843,10 @@ export interface CharacterProfile {
 
   // 记忆宫殿 (Memory Palace)
   memoryPalaceEnabled?: boolean;
+
+  // 备忘录 (Memo) — 全局开关在 OSContext（memoGlobalEnabled），
+  // 这里是 per-char 启用标记。两者都为 true 时该角色才会看到备忘注入 + 工具调用。
+  memoEnabled?: boolean;
   /**
    * 是否启用"palace 提取后自动同步归档"：开启后每次 buffer 处理成功都会把新记忆按日期
    * 合成 YAML MemoryFragment 追加到 char.memories，并推 hideBeforeMessageId 自动隐藏
@@ -4181,4 +4186,56 @@ export interface LifeSimState {
     buildings?: SimBuilding[];
     worldInventory?: Record<string, number>;
     worldGold?: number;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 备忘录 (Memo) — per-char 私人备忘
+//
+// 设计要点（用户决策）：
+// - 不同 Char 有独立备忘录，私聊场景 Char 每轮可看到自己的备忘
+// - 类型：daily（日常）/ todo（待办），带 TAG + 创建时间 + 最后修改时间
+// - 上限 10 条，超上限需删旧才能创建新
+// - 排序：按修改时间倒序（最近改的在最前）
+// - 软删回收站：delete 后进 deleted_memos 表，18 天后硬删，期间可恢复 / 手动硬删
+// - 全局默认关闭，手动对某个 Char 勾选启用（char.memoEnabled = true）
+// - 副独立 API（memoApiConfig）：仅用于 Char 生成/修改备忘内容时的"润色"调用
+//   与主 apiConfig / 记忆宫殿副 API / 情绪副 API 完全独立，各管各的
+// - 其他个人化场景（fire_pack 等）仅查看，不注入工具说明
+// - 私聊专属（useChatAI 只被私聊用），工具调用支持 list/create/update/delete/toggle_todo
+// - 创建备忘时用户侧要看到 toast 提示
+// - 角色删除时级联删除该角色的所有备忘 + 回收站条目
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type MemoType = 'daily' | 'todo';
+
+/** 一条备忘（per-char，存 IndexedDB memos 表） */
+export interface Memo {
+    id: string;             // uuid
+    charId: string;         // 所属角色
+    type: MemoType;         // daily=日常备忘 / todo=待办
+    content: string;        // 内容（≤60 字，副 API 润色后写入）
+    tags: string[];         // 自由 TAG，用户或 Char 推断
+    done: boolean;          // 仅 todo 有效：true=已完成
+    createdAt: number;      // 创建时间戳
+    updatedAt: number;      // 最后修改时间戳（排序键，倒序）
+}
+
+/** 回收站条目（软删 18 天后硬删） */
+export interface DeletedMemo {
+    id: string;             // 原 memo id（保持不变，恢复时沿用）
+    charId: string;
+    type: MemoType;
+    content: string;
+    tags: string[];
+    done: boolean;
+    createdAt: number;
+    updatedAt: number;
+    deletedAt: number;      // 进入回收站的时间戳；deletedAt + 18d 之后会被硬删
+}
+
+/** 备忘录专用副 API 配置（独立于主 apiConfig / 记忆宫殿副 API） */
+export interface MemoApiConfig {
+    baseUrl: string;        // OpenAI 兼容地址，如 https://api.openai.com/v1
+    apiKey: string;
+    model: string;          // 如 gpt-4o-mini
 }

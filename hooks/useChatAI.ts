@@ -51,6 +51,7 @@ import { announceInstantChatRoute, getInstantChatPending, resolveInstantChatRead
 import { INSTANT_TOTAL_TIMEOUT_MS } from '../worker/amsg/src/instantChat';
 import { appendInstantTraceEntry } from '../utils/instantTraceLog';
 import { AMSG2_TOOLS, AMSG2_TOOL_NAMES, createAmsg2ToolSession, executeAmsg2Tool, isAmsg2GlobalReady } from '../utils/amsg2ToolBridge';
+import { MEMO_TOOLS, MEMO_TOOL_NAMES, executeMemoTool, type MemoToolDeps } from '../utils/memoToolBridge';
 import { shouldSendThinkingParams } from '../utils/thinkingGate';
 import { routeMiniAppToolCall } from '../utils/miniAppToolRoute';
 import { applyEmotionEvalRaw, extractAssistantText } from '../utils/emotionApply';
@@ -457,6 +458,9 @@ interface UseChatAIProps {
     luckinMiniAppRef?: MutableRefObject<import('../utils/luckinToolBridge').LuckinMiniAppSnapshot | undefined>;
     /** 瑞幸聊天点单模式 (点"瑞一杯"激活): 角色直接调真实 8 工具 + 注入定位/提示词 */
     luckinChatRef?: MutableRefObject<import('../utils/luckinToolBridge').LuckinChatState | undefined>;
+    /** 备忘录全局开关 + 副 API 配置。两者都为 true（开关开 + char.memoEnabled）才注入工具 */
+    memoGlobalEnabled?: boolean;
+    memoApiConfig?: import('../types').MemoApiConfig;
 }
 
 export const useChatAI = ({
@@ -477,6 +481,8 @@ export const useChatAI = ({
     mcdMiniAppRef,
     luckinMiniAppRef,
     luckinChatRef,
+    memoGlobalEnabled,
+    memoApiConfig,
 }: UseChatAIProps) => {
     
     // 音乐上下文 — 用于聊天时注入"user 正在听什么 + 当前歌词窗口"
@@ -750,6 +756,14 @@ export const useChatAI = ({
         const amsg2Session = createAmsg2ToolSession({
             char, userProfile, groups, realtimeConfig, apiConfig, updateCharacter,
         });
+        // 本轮备忘录工具会话：seenCalls 用于防打转（同名同参第二次直接打回）。
+        // 跟 amsg2 同一套口径，复用 agenticToolFeedback 的指纹机制。
+        const memoSession: MemoToolDeps = {
+            char: char as CharacterProfile,
+            memoApiConfig: memoApiConfig || { baseUrl: '', apiKey: '', model: '' },
+            seenCalls: [],
+            addToast: (msg, kind) => addToast(msg, kind || 'info'),
+        };
         // 本轮里角色自己新排出来的任务。排程现状块每轮现算时靠它把这些点名标出来——不标
         // 的话角色分不清清单上哪条是自己刚排的，回头又排一条一模一样的。
         const amsg2CreatedThisTurn = new Set<string>();
@@ -770,6 +784,14 @@ export const useChatAI = ({
                 if (!taskUuidsBefore.has(task.taskUuid)) amsg2CreatedThisTurn.add(task.taskUuid);
             }
             // 带上 name：Gemini 兼容层要求工具结果的 name 非空，缺了会被判 INVALID_ARGUMENT。
+            loopMessages.push(buildToolResultMessage(tc, result) as any);
+            setSearchStatus('');
+        };
+
+        // 备忘录工具调用分发：executeMemoTool 跑完后回喂给模型，跟 amsg2 同一套回话口径。
+        const runMemoToolCall = async (tc: any, fname: string, args: any, loopMessages: any[]) => {
+            setSearchStatus(`正在执行：${fname}...`);
+            const result = await executeMemoTool(fname, args, memoSession);
             loopMessages.push(buildToolResultMessage(tc, result) as any);
             setSearchStatus('');
         };
@@ -1229,6 +1251,14 @@ export const useChatAI = ({
                     // 照常渲染——角色至少知道自己名下有哪些任务，不至于一问三不知再排一条。
                     console.warn('[amsg2] 作废回执检出失败，本轮只带进行中清单', e);
                 }
+            }
+
+            // 备忘录工具：全局开关开 + 角色勾选启用时注入 list/create/update/delete/toggle。
+            // 私聊专属（useChatAI 只被私聊用，群聊不走这里）。
+            const memoToolsInjected = !!(memoGlobalEnabled && char.memoEnabled === true && memoApiConfig);
+            if (memoToolsInjected) {
+                baseReqBody.tools = [...(baseReqBody.tools || []), ...MEMO_TOOLS];
+                if (!baseReqBody.tool_choice) baseReqBody.tool_choice = 'auto';
             }
 
             /**
@@ -1775,6 +1805,11 @@ export const useChatAI = ({
                         // 主动消息 2.0 工具
                         if (AMSG2_TOOL_NAMES.has(fname)) {
                             await runAmsg2ToolCall(tc, fname, args, loopMessages);
+                            continue;
+                        }
+                        // 备忘录工具
+                        if (MEMO_TOOL_NAMES.has(fname)) {
+                            await runMemoToolCall(tc, fname, args, loopMessages);
                             continue;
                         }
                         // 只开了 MCP 没开瑞幸时, 幻觉出的未知工具名直接回错误让模型自我纠正

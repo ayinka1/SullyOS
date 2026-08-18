@@ -3154,15 +3154,6 @@ export interface Toast {
     type: 'success' | 'error' | 'info';
 }
 
-export interface XhsStockImage {
-    id: string;
-    url: string;           // 图床URL (must be public https)
-    tags: string[];        // 标签 e.g. ['美食','咖啡','下午茶']
-    addedAt: number;       // timestamp
-    usedCount: number;     // 被使用次数
-    lastUsedAt?: number;   // 上次使用时间
-}
-
 export interface GalleryImage {
     id: string;
     charId: string;
@@ -3832,7 +3823,6 @@ export interface FullBackupData {
 
     xhsActivities?: XhsActivityRecord[];
     xhsOwnedPosts?: XhsOwnedPost[];
-    xhsStockImages?: XhsStockImage[];
 
     // Study Room settings
     studyApiConfig?: Partial<APIConfig>;

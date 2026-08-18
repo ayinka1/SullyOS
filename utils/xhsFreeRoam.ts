@@ -521,27 +521,9 @@ export const XhsFreeRoamEngine = {
             else if (decision.action === 'post') {
                 callbacks.onStatus(`${char.name}正在发帖: ${decision.title}...`);
 
-                // Try to get images from XHS stock
-                let images: string[] = [];
-                try {
-                    const stockImgs = await DB.getXhsStockImages();
-                    if (stockImgs.length > 0) {
-                        const keywords = [decision.title, decision.content, ...(decision.tags || [])].join(' ').toLowerCase();
-                        const scored = stockImgs.map(img => ({
-                            img,
-                            score: img.tags.reduce((s, t) => s + (keywords.includes(t.toLowerCase()) ? 10 : 0), 0) + Math.max(0, 5 - (img.usedCount || 0))
-                        })).sort((a, b) => b.score - a.score);
-                        if (scored[0]?.img.url) {
-                            images = [scored[0].img.url];
-                            DB.updateXhsStockImageUsage(scored[0].img.id).catch(() => {});
-                        }
-                    }
-                } catch { /* ignore stock failures */ }
-
                 const postResult = await XhsMcpClient.publishNote(mcpUrl, {
                     title: decision.title || '无题',
                     content: decision.content || '',
-                    images: images.length > 0 ? images : undefined,
                     tags: decision.tags,
                 });
                 const publishedNoteId = postResult.success ? extractPublishedNoteId(postResult) : '';

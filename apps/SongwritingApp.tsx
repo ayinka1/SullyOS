@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useOS } from '../context/OSContext';
-import { SongSheet, SongLine, SongComment, SongMood, SongGenre, SongAudio, MusicProvider, SongTemplateSection, LyricCoWritingStyle, AppID } from '../types';
+import { SongSheet, SongLine, SongComment, SongMood, SongGenre, SongAudio, MusicProvider, SongTemplateSection, LyricCoWritingStyle } from '../types';
 import {
     SONG_GENRES,
     SONG_MOODS,
@@ -177,7 +177,7 @@ const buildLyricSlots = (song: SongSheet): LyricSlot[] => {
 // --- Main App ---
 
 const SongwritingApp: React.FC = () => {
-    const { closeApp, openApp, songs, addSong, updateSong, deleteSong, characters, apiConfig, addToast, userProfile, characterGroups } = useOS();
+    const { closeApp, songs, addSong, updateSong, deleteSong, characters, apiConfig, addToast, userProfile, characterGroups } = useOS();
     const { addLocalSong, removeLocalSong, localAlbumSongs, playSong, current: currentMusicSong, markRegenerating } = useMusic();
 
     // Navigation
@@ -1522,7 +1522,7 @@ const SongwritingApp: React.FC = () => {
         addToast('已从「一起写的歌」移除', 'info');
     };
 
-    /** Step 2: confirm cover → actually add to album + play + jump to MusicApp. */
+    /** Step 2: confirm cover → actually add to album + play via global mini player. */
     const handleConfirmAddToAlbum = async () => {
         if (!activeSong || !activeSong.audio) return;
 
@@ -1575,9 +1575,8 @@ const SongwritingApp: React.FC = () => {
         addLocalSong(localSong);
         trackEvent('把成品歌加进音乐 App 专辑');
         setShowCoverConfirm(false);
-        addToast(`已加入「一起写的歌」专辑 ❤︎`, 'success');
+        addToast(`已加入「一起写的歌」专辑 ❤︎ 已开始播放`, 'success');
         playSong(localSong, { alsoSetQueue: true });
-        openApp(AppID.Music);
     };
 
     // Pre-compute the dual cover when user picks that mode for instant preview.

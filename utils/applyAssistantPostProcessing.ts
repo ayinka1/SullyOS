@@ -125,23 +125,7 @@ async function xhsPublish(
     content: string,
     tags: string[],
 ): Promise<{ success: boolean; noteId?: string; message: string }> {
-    let images: string[] = [];
-    try {
-        const stockImgs = await DB.getXhsStockImages();
-        if (stockImgs.length > 0) {
-            const keywords = [title, content, ...tags].join(' ').toLowerCase();
-            const scored = stockImgs.map(img => ({
-                img,
-                score: img.tags.reduce((s: number, t: string) => s + (keywords.includes(t.toLowerCase()) ? 10 : 0), 0) + Math.max(0, 5 - (img.usedCount || 0))
-            })).sort((a, b) => b.score - a.score);
-            if (scored[0]?.img.url) {
-                images = [scored[0].img.url];
-                DB.updateXhsStockImageUsage(scored[0].img.id).catch(() => {});
-            }
-        }
-    } catch { /* ignore stock failures */ }
-
-    const r = await XhsMcpClient.publishNote(conf.mcpUrl, { title, content, tags, images: images.length > 0 ? images : undefined });
+    const r = await XhsMcpClient.publishNote(conf.mcpUrl, { title, content, tags });
     const noteId = r.success ? extractPublishedNoteId(r) : '';
     if (r.success && noteId) {
         const now = Date.now();

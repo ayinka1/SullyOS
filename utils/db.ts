@@ -5,7 +5,7 @@ import {
     CharacterProfile, ChatTheme, Message, UserProfile,
     Task, Anniversary, DiaryEntry, RoomTodo, RoomNote, DailySchedule,
     GalleryImage, FullBackupData, GroupProfile, SocialPost, StudyCourse, GameSession, Worldbook, NovelBook, Emoji, EmojiCategory,
-    BankTransaction, SavingsGoal, BankFullState, DollhouseState, XhsStockImage, XhsActivityRecord, XhsOwnedPost, SongSheet, QuizSession, GuidebookSession,
+    BankTransaction, SavingsGoal, BankFullState, DollhouseState, XhsActivityRecord, XhsOwnedPost, SongSheet, QuizSession, GuidebookSession,
     LifeSimState, HandbookEntry, Tracker, TrackerEntry, HotNewsSnapshot,
     LifeRecord, MedPlan, LifeRecordSettings, CharacterGroup,
     VRWorldNovel, VRNovelAnnotation, CustomCreatorPart, VRMusicRoomState, VRGuestbookState, VRScript, VRStagedPlay, VRLetter,
@@ -1341,48 +1341,6 @@ export const DB = {
       const db = await openDB();
       const transaction = db.transaction(STORE_GALLERY, 'readwrite');
       transaction.objectStore(STORE_GALLERY).delete(id);
-  },
-
-  // --- XHS Stock Images ---
-  getXhsStockImages: async (): Promise<XhsStockImage[]> => {
-      const db = await openDB();
-      return new Promise((resolve, reject) => {
-          const transaction = db.transaction(STORE_XHS_STOCK, 'readonly');
-          const request = transaction.objectStore(STORE_XHS_STOCK).getAll();
-          request.onsuccess = () => resolve(request.result || []);
-          request.onerror = () => reject(request.error);
-      });
-  },
-
-  saveXhsStockImage: async (img: XhsStockImage): Promise<void> => {
-      const db = await openDB();
-      const transaction = db.transaction(STORE_XHS_STOCK, 'readwrite');
-      transaction.objectStore(STORE_XHS_STOCK).put(img);
-  },
-
-  deleteXhsStockImage: async (id: string): Promise<void> => {
-      const db = await openDB();
-      const transaction = db.transaction(STORE_XHS_STOCK, 'readwrite');
-      transaction.objectStore(STORE_XHS_STOCK).delete(id);
-  },
-
-  updateXhsStockImageUsage: async (id: string): Promise<void> => {
-      const db = await openDB();
-      const transaction = db.transaction(STORE_XHS_STOCK, 'readwrite');
-      const store = transaction.objectStore(STORE_XHS_STOCK);
-      return new Promise((resolve, reject) => {
-          const req = store.get(id);
-          req.onsuccess = () => {
-              const data = req.result as XhsStockImage;
-              if (data) {
-                  data.usedCount = (data.usedCount || 0) + 1;
-                  data.lastUsedAt = Date.now();
-                  store.put(data);
-                  resolve();
-              } else reject(new Error('Stock image not found'));
-          };
-          req.onerror = () => reject(req.error);
-      });
   },
 
   // --- XHS Activities (Free Roam) ---
@@ -2883,7 +2841,7 @@ export const DB = {
           });
       };
 
-      const [characters, characterGroups, messages, themes, emojis, emojiCategories, assets, galleryImages, userProfiles, diaries, tasks, anniversaries, roomTodos, roomNotes, groups, journalStickers, socialPosts, courses, games, worldbooks, storyTheaters, storyTheaterPresets, storyTheaterMasks, novels, bankTx, bankData, xhsActivities, xhsOwnedPosts, xhsStockImages, songs, quizzes, guidebookSessions, scheduledMessages, lifeSimStates, handbooks, trackers, trackerEntries, hotNewsSnapshots, vrNovels, vrAnnotations, customCreatorParts, vrMusic, vrGuestbook, vrScripts, vrStagedPlays, vrPresets, vrLetters, vrSettings, worlds, worldEpisodes, lifeRecords, medPlans, lifeRecordSettings] = await Promise.all([
+      const [characters, characterGroups, messages, themes, emojis, emojiCategories, assets, galleryImages, userProfiles, diaries, tasks, anniversaries, roomTodos, roomNotes, groups, journalStickers, socialPosts, courses, games, worldbooks, storyTheaters, storyTheaterPresets, storyTheaterMasks, novels, bankTx, bankData, xhsActivities, xhsOwnedPosts, songs, quizzes, guidebookSessions, scheduledMessages, lifeSimStates, handbooks, trackers, trackerEntries, hotNewsSnapshots, vrNovels, vrAnnotations, customCreatorParts, vrMusic, vrGuestbook, vrScripts, vrStagedPlays, vrPresets, vrLetters, vrSettings, worlds, worldEpisodes, lifeRecords, medPlans, lifeRecordSettings] = await Promise.all([
           getAllFromStore(STORE_CHARACTERS),
           getAllFromStore(STORE_CHAR_GROUPS),
           getAllFromStore(STORE_MESSAGES),
@@ -2912,7 +2870,6 @@ export const DB = {
           getAllFromStore(STORE_BANK_DATA),
           getAllFromStore(STORE_XHS_ACTIVITIES),
           getAllFromStore(STORE_XHS_OWNED_POSTS),
-          getAllFromStore(STORE_XHS_STOCK),
           getAllFromStore(STORE_SONGS),
           getAllFromStore(STORE_QUIZZES),
           getAllFromStore(STORE_GUIDEBOOK),
@@ -2955,7 +2912,6 @@ export const DB = {
           bankTransactions: bankTx,
           xhsActivities,
           xhsOwnedPosts,
-          xhsStockImages,
           songs,
           quizSessions: quizzes,
           guidebookSessions,
@@ -3013,7 +2969,7 @@ export const DB = {
           STORE_TASKS, STORE_ANNIVERSARIES, STORE_ROOM_TODOS, STORE_ROOM_NOTES,
           STORE_GROUPS, STORE_JOURNAL_STICKERS, STORE_SOCIAL_POSTS, STORE_COURSES, STORE_GAMES, STORE_WORLDBOOKS, STORE_STORY_THEATERS, STORE_STORY_THEATER_PRESETS, STORE_STORY_THEATER_MASKS, STORE_NOVELS, STORE_SONGS,
           STORE_BANK_TX, STORE_BANK_DATA,
-          STORE_XHS_ACTIVITIES, STORE_XHS_OWNED_POSTS, STORE_XHS_STOCK,
+          STORE_XHS_ACTIVITIES, STORE_XHS_OWNED_POSTS,
           STORE_QUIZZES,
           STORE_GUIDEBOOK,
           STORE_SCHEDULED,
@@ -3096,7 +3052,6 @@ export const DB = {
           data.lifeSimState !== undefined,
           data.bankTransactions !== undefined,
           data.xhsActivities !== undefined,
-          data.xhsStockImages !== undefined,
           data.memoryNodes !== undefined,
           data.memoryVectors !== undefined,
           data.memoryLinks !== undefined,
@@ -3503,10 +3458,6 @@ export const DB = {
           await clearAndAdd(STORE_XHS_OWNED_POSTS, data.xhsOwnedPosts, '角色小红书主页', false);
           data.xhsOwnedPosts = undefined as any;
       }, data.xhsOwnedPosts?.length || 0);
-      await runSection('小红书图库', data.xhsStockImages !== undefined, async () => {
-          await clearAndAdd(STORE_XHS_STOCK, data.xhsStockImages, '小红书图库', true);
-          data.xhsStockImages = undefined as any;
-      }, data.xhsStockImages?.length || 0);
 
       // Memory Palace (记忆宫殿)
       await runSection('记忆节点', data.memoryNodes !== undefined, async () => {

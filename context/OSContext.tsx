@@ -4317,7 +4317,6 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                       break;
                   }
                   case 'xhs_activities': backupData.xhsActivities = processedData; break;
-                  case 'xhs_stock': backupData.xhsStockImages = processedData; break;
                   case 'quizzes': backupData.quizSessions = processedData; break;
                   case 'guidebook': backupData.guidebookSessions = processedData; break;
                   case 'scheduled_messages': backupData.scheduledMessages = processedData; break;

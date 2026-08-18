@@ -48,6 +48,8 @@ const isReleaseBranch = RELEASE_BRANCHES.has(gitInfo.branch);
 let showBuildBadge = !isReleaseBranch;
 if (process.env.VITE_HIDE_BUILD_BADGE === '1') showBuildBadge = false;
 if (process.env.VITE_SHOW_BUILD_BADGE === '1') showBuildBadge = true;
+// Netlify 生产部署一律隐藏钳子图标 + 右下角构建角标（任何分支都不显示）
+if (process.env.NETLIFY === 'true' && process.env.CONTEXT === 'production') showBuildBadge = false;
 
 export default defineConfig({
   resolve: {

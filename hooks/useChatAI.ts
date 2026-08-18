@@ -51,7 +51,6 @@ import { announceInstantChatRoute, getInstantChatPending, resolveInstantChatRead
 import { INSTANT_TOTAL_TIMEOUT_MS } from '../worker/amsg/src/instantChat';
 import { appendInstantTraceEntry } from '../utils/instantTraceLog';
 import { AMSG2_TOOLS, AMSG2_TOOL_NAMES, createAmsg2ToolSession, executeAmsg2Tool, isAmsg2GlobalReady } from '../utils/amsg2ToolBridge';
-import { MEMO_TOOLS, MEMO_TOOL_NAMES, executeMemoTool, type MemoToolDeps } from '../utils/memoToolBridge';
 import { shouldSendThinkingParams } from '../utils/thinkingGate';
 import { buildClaudeProxyCompatibilityBody, shouldRetryClaudeProxyCompatibility } from '../utils/claudeProxyCompat';
 import { routeMiniAppToolCall } from '../utils/miniAppToolRoute';
@@ -459,9 +458,6 @@ interface UseChatAIProps {
     luckinMiniAppRef?: MutableRefObject<import('../utils/luckinToolBridge').LuckinMiniAppSnapshot | undefined>;
     /** 瑞幸聊天点单模式 (点"瑞一杯"激活): 角色直接调真实 8 工具 + 注入定位/提示词 */
     luckinChatRef?: MutableRefObject<import('../utils/luckinToolBridge').LuckinChatState | undefined>;
-    /** 备忘录全局开关 + 副 API 配置。两者都为 true（开关开 + char.memoEnabled）才注入工具 */
-    memoGlobalEnabled?: boolean;
-    memoApiConfig?: import('../types').MemoApiConfig;
 }
 
 export const useChatAI = ({
@@ -482,8 +478,6 @@ export const useChatAI = ({
     mcdMiniAppRef,
     luckinMiniAppRef,
     luckinChatRef,
-    memoGlobalEnabled,
-    memoApiConfig,
 }: UseChatAIProps) => {
     
     // 音乐上下文 — 用于聊天时注入"user 正在听什么 + 当前歌词窗口"

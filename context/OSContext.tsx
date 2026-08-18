@@ -1,6 +1,6 @@
 
 import React, { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
-import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGroup, ChatTheme, Toast, FullBackupData, UserProfile, ApiPreset, GroupProfile, SystemLog, Worldbook, NovelBook, SongSheet, Message, RealtimeConfig, AppearancePreset, CloudBackupConfig, CloudBackupFile, MemoApiConfig } from '../types';
+import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGroup, ChatTheme, Toast, FullBackupData, UserProfile, ApiPreset, GroupProfile, SystemLog, Worldbook, NovelBook, SongSheet, Message, RealtimeConfig, AppearancePreset, CloudBackupConfig, CloudBackupFile } from '../types';
 import { DB } from '../utils/db';
 import type { AvatarTouchRecord } from '../utils/avatarTouch';
 import { clampClaudeTemperature, modelRejectsSamplingParams, stripSamplingParams } from '../utils/samplingParamCompat';
@@ -347,15 +347,6 @@ interface OSContextType {
   // 记忆宫殿全局配置（所有角色共用）
   memoryPalaceConfig: MemoryPalaceGlobalConfig;
   updateMemoryPalaceConfig: (updates: Partial<MemoryPalaceGlobalConfig>) => void;
-
-  // 备忘录全局开关 + 副 API 配置。
-  // 全局开关默认 false：即使某角色 char.memoEnabled=true，全局开关没开也不注入。
-  // 副 API（memoApiConfig）：仅用于 Char 生成/修改备忘内容时的"润色"调用，
-  // 与主 apiConfig / 记忆宫殿副 API / 情绪副 API 完全独立。
-  memoGlobalEnabled: boolean;
-  updateMemoGlobalEnabled: (enabled: boolean) => void;
-  memoApiConfig: MemoApiConfig;
-  updateMemoApiConfig: (updates: Partial<MemoApiConfig>) => void;
 
   // 情绪 API（所有角色同步；是否启用仍各自独立）
   syncEmotionApiToAllCharacters: (api: { baseUrl: string; apiKey: string; model: string } | undefined) => void;
@@ -893,16 +884,6 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   const [realtimeConfig, setRealtimeConfig] = useState<RealtimeConfig>(defaultRealtimeConfig);
   const [memoryPalaceConfig, setMemoryPalaceConfig] = useState<MemoryPalaceGlobalConfig>(() => {
     try { const s = localStorage.getItem('os_memory_palace_config'); return s ? { ...defaultMemoryPalaceConfig, ...JSON.parse(s) } : defaultMemoryPalaceConfig; } catch { return defaultMemoryPalaceConfig; }
-  });
-
-  // 备忘录全局开关 + 副 API 配置。默认全空（关闭 + 无副 API）。
-  // 两者都存 localStorage，跟记忆宫殿副 API 的存储模式一致。
-  const [memoGlobalEnabled, setMemoGlobalEnabled] = useState<boolean>(() => {
-    try { return localStorage.getItem('os_memo_global_enabled') === '1'; } catch { return false; }
-  });
-  const defaultMemoApiConfig: MemoApiConfig = { baseUrl: '', apiKey: '', model: '' };
-  const [memoApiConfig, setMemoApiConfig] = useState<MemoApiConfig>(() => {
-    try { const s = localStorage.getItem('os_memo_api_config'); return s ? { ...defaultMemoApiConfig, ...JSON.parse(s) } : defaultMemoApiConfig; } catch { return defaultMemoApiConfig; }
   });
   const defaultRemoteVectorConfig = { enabled: false, supabaseUrl: '', supabaseAnonKey: '', initialized: false };
   const [remoteVectorConfig, setRemoteVectorConfig] = useState(() => {
@@ -3010,18 +2991,6 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
     localStorage.setItem('os_memory_palace_config', JSON.stringify(newConfig));
   };
 
-  // 备忘录：全局开关 + 副 API 配置的 update 函数。
-  // 副 API 只用于 Char 生成/修改备忘内容时的"润色"调用，跟主 apiConfig 完全独立。
-  const updateMemoGlobalEnabled = (enabled: boolean) => {
-    setMemoGlobalEnabled(enabled);
-    try { localStorage.setItem('os_memo_global_enabled', enabled ? '1' : '0'); } catch { /* ignore */ }
-  };
-  const updateMemoApiConfig = (updates: Partial<MemoApiConfig>) => {
-    const newConfig: MemoApiConfig = { ...memoApiConfig, ...updates };
-    setMemoApiConfig(newConfig);
-    try { localStorage.setItem('os_memo_api_config', JSON.stringify(newConfig)); } catch { /* ignore */ }
-  };
-
   // 情绪 API 同步到所有角色：API 字段（baseUrl/apiKey/model）所有角色共用，
   // 各角色自身的 enabled 标志保持不变。
   // 注意：与记忆宫殿副 API（memoryPalaceConfig.lightLLM）完全独立，两者各管各的。
@@ -5047,10 +5016,6 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
     updateRealtimeConfig,
     memoryPalaceConfig,
     updateMemoryPalaceConfig,
-    memoGlobalEnabled,
-    updateMemoGlobalEnabled,
-    memoApiConfig,
-    updateMemoApiConfig,
     syncEmotionApiToAllCharacters,
     remoteVectorConfig,
     updateRemoteVectorConfig,

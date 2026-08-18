@@ -1,19 +1,41 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import JSZip from 'jszip';
 import {
   buildStoredLive2DPackage,
   buildLive2DPerformanceMix,
+  createLive2DRuntimeTextureUrl,
+  downscaleOversizedLive2DTextures,
+  extractStreamingLive2DRuntimeArchive,
   findLive2DActionsForPerformance,
+  getLive2DTextureResizeTarget,
+  getLive2DTextureMaxDimension,
+  getLive2DTextureQuality,
   getLive2DAIActions,
+  getActiveLive2DWardrobeParameters,
   getLive2DWardrobeActions,
   inferLive2DActionTags,
   inspectLive2DPackage,
+  Live2DMissingFilesError,
+  readLive2DTextureDimensions,
+  removeLive2DWardrobeAction,
   sniffImageMime,
   upgradeLive2DAutoPermissions,
   type Live2DAvatarConfig,
 } from './live2dModelStore';
 
 const blob = (value = '') => new Blob([value], { type: 'application/octet-stream' });
+
+const pngHeader = (width: number, height: number): Blob => {
+  const bytes = new Uint8Array(24);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(16, width, false);
+  view.setUint32(20, height, false);
+  return new Blob([bytes], { type: 'image/png' });
+};
+
+afterEach(() => vi.unstubAllGlobals());
 
 const modelJson = JSON.stringify({
   Version: 3,
@@ -41,7 +63,7 @@ const packageEntries = [
     Curves: [{ Target: 'Parameter', Id: 'ParamArmLA' }, { Target: 'Model', Id: 'EyeBlink' }],
   })) },
   { path: 'Skylar/expressions/happy.exp3.json', blob: blob(JSON.stringify({
-    Parameters: [{ Id: 'ParamMouthForm', Value: 1 }],
+    Parameters: [{ Id: 'ParamMouthForm', Value: 1, Blend: 'Overwrite' }],
   })) },
   { path: 'Skylar/expressions/angry.exp3.json', blob: blob('{}') },
 ];
@@ -57,15 +79,79 @@ describe('Live2D 模型导入解析', () => {
     expect(stored.size).toBeGreaterThan(64 * 1024);
   });
 
+  it('从压缩 ZIP 逐项读取，并把 8K 纹理直接生成 2K 运行图', async () => {
+    const close = vi.fn();
+    const createBitmap = vi.fn(async () => ({ width: 2048, height: 1024, close }));
+    class MockOffscreenCanvas {
+      constructor(public width: number, public height: number) {}
+      getContext() { return { drawImage: vi.fn() }; }
+      async convertToBlob(options: { type: string }) {
+        return new Blob(['streamed-2k'], { type: options.type });
+      }
+    }
+    vi.stubGlobal('createImageBitmap', createBitmap);
+    vi.stubGlobal('OffscreenCanvas', MockOffscreenCanvas);
+
+    const zip = new JSZip();
+    zip.file('Model/Model.model3.json', JSON.stringify({
+      Version: 3,
+      FileReferences: { Moc: 'Model.moc3', Textures: ['texture.png'] },
+    }));
+    zip.file('Model/Model.moc3', 'moc');
+    zip.file('Model/texture.png', await pngHeader(8192, 4096).arrayBuffer());
+    const archive = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    const progress = vi.fn();
+
+    const result = await extractStreamingLive2DRuntimeArchive(
+      archive,
+      'Model/Model.model3.json',
+      2048,
+      progress,
+    );
+
+    expect(result.entries.map(entry => entry.path)).toEqual([
+      'Model/Model.model3.json',
+      'Model/Model.moc3',
+      'Model/texture.png',
+    ]);
+    expect(await result.entries[2].blob.text()).toBe('streamed-2k');
+    expect(result.resizedTextures).toEqual([expect.objectContaining({
+      path: 'Model/texture.png',
+      fromWidth: 8192,
+      toWidth: 2048,
+      toHeight: 1024,
+    })]);
+    expect(createBitmap).toHaveBeenCalledWith(expect.any(Blob), expect.objectContaining({
+      resizeWidth: 2048,
+      resizeHeight: 1024,
+    }));
+    expect(close).toHaveBeenCalledOnce();
+    expect(progress).toHaveBeenCalledWith(expect.stringContaining('低内存解包'));
+  });
+
+  it('运行纹理使用原始 Blob URL，不再复制为 Base64 或伪造扩展名', async () => {
+    const createObjectURL = vi.fn(() => 'blob:live2d-texture');
+    vi.stubGlobal('URL', { createObjectURL, revokeObjectURL: vi.fn() });
+
+    const url = await createLive2DRuntimeTextureUrl(pngHeader(2048, 2048), 'Model/texture.bin');
+
+    expect(url).toBe('blob:live2d-texture');
+    expect(createObjectURL).toHaveBeenCalledWith(expect.objectContaining({ type: 'image/png' }));
+    expect(url).not.toContain('base64');
+    expect(url).not.toContain('#');
+  });
+
   it('从 model3.json 解析动作、表情、标签与口型参数，自动开放安全动作', async () => {
     const result = await inspectLive2DPackage(packageEntries);
     expect(result.modelPath).toBe('Skylar/Skylar.model3.json');
+    expect(result.texturePaths).toEqual(['Skylar/textures/texture_00.png']);
     expect(result.lipSyncParameterIds).toEqual(['ParamMouthOpenY', 'ParamMouthForm']);
     expect(result.actions).toHaveLength(4);
     expect(result.actions.filter(action => action.group !== 'Idle').every(action => action.permission === 'ai')).toBe(true);
     expect(result.actions.find(action => action.group === 'Idle')?.permission).toBe('manual');
     expect(result.actions.find(action => action.name === 'smile')).toMatchObject({
       kind: 'expression', tags: ['happy'], permission: 'ai', parameterIds: ['ParamMouthForm'],
+      parameterValues: [{ id: 'ParamMouthForm', value: 1, blend: 'Overwrite' }],
     });
     expect(result.actions.find(action => action.group === 'TapBody')).toMatchObject({
       tags: expect.arrayContaining(['wave']),
@@ -73,9 +159,43 @@ describe('Live2D 模型导入解析', () => {
     });
   });
 
-  it('模型引用缺文件时拒绝导入并指出包不完整', async () => {
-    await expect(inspectLive2DPackage(packageEntries.filter(entry => !entry.path.endsWith('texture_00.png'))))
-      .rejects.toThrow('模型引用的文件不完整');
+  it('模型引用缺文件时保留短提示，并向控制台返回完整路径诊断', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const entries = packageEntries.filter(entry => !entry.path.endsWith('texture_00.png'));
+    try {
+      await inspectLive2DPackage(entries);
+      throw new Error('expected missing-file rejection');
+    } catch (error) {
+      expect(error).toBeInstanceOf(Live2DMissingFilesError);
+      expect((error as Live2DMissingFilesError).message).toContain('模型引用的文件不完整');
+      expect((error as Live2DMissingFilesError).missingFiles).toEqual([
+        expect.objectContaining({
+          reference: 'textures/texture_00.png',
+          resolvedPath: 'Skylar/textures/texture_00.png',
+          referencedBy: 'Skylar/Skylar.model3.json',
+        }),
+      ]);
+      expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('完整缺失引用诊断'));
+      expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('Skylar/textures/texture_00.png'));
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it('缺失诊断指出大小写错误和同名文件所在位置', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const entries = packageEntries
+      .filter(entry => !entry.path.endsWith('texture_00.png'))
+      .concat({ path: 'Skylar/Textures/TEXTURE_00.PNG', blob: blob('png') });
+    try {
+      await inspectLive2DPackage(entries);
+      throw new Error('expected missing-file rejection');
+    } catch (error) {
+      const detail = (error as Live2DMissingFilesError).missingFiles[0];
+      expect(detail.caseInsensitiveMatch).toBe('Skylar/Textures/TEXTURE_00.PNG');
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('解析 VTube Studio 热键、未登记表情、待机动画和保存的构图', async () => {
@@ -141,6 +261,25 @@ describe('Live2D 模型导入解析', () => {
     expect(findLive2DActionsForPerformance(config, { modelAction: 'outfit-night', emotion: 'happy' }).map(action => action.id))
       .toEqual(['expression-smile']);
     expect(buildLive2DPerformanceMix(config, { modelActions: ['outfit-night'] }).expression).toBeUndefined();
+  });
+
+  it('removes a clothing choice without making its underlying action AI-callable', () => {
+    const config = {
+      format: 'live2d',
+      actionPolicyVersion: 2,
+      activeWardrobeActionId: 'outfit-night',
+      actions: [
+        { id: 'outfit-night', kind: 'expression', name: 'night', file: 'night.exp3.json', tags: [], permission: 'manual', wardrobe: true },
+        { id: 'outfit-day', kind: 'expression', name: 'day', file: 'day.exp3.json', tags: [], permission: 'manual', wardrobe: true },
+      ],
+    } as unknown as Live2DAvatarConfig;
+    const next = removeLive2DWardrobeAction(config, 'outfit-night');
+    expect(next.activeWardrobeActionId).toBe('outfit-day');
+    expect(next.actions.find(action => action.id === 'outfit-night')).toMatchObject({
+      wardrobe: false,
+      permission: 'manual',
+    });
+    expect(getLive2DAIActions(next)).toEqual([]);
   });
 
   it('旧模型一次性自动开放未分类原生动作，同时保留用户覆盖和待机动作', () => {
@@ -216,6 +355,122 @@ describe('Live2D 模型导入解析', () => {
     expect(await sniffImageMime(jpeg)).toBe('image/jpeg');
     expect(await sniffImageMime(webp)).toBe('image/webp');
     expect(await sniffImageMime(junk)).toBeNull();
+  });
+
+  it('resolves the selected wardrobe as a persistent parameter layer', () => {
+    const config = {
+      format: 'live2d',
+      activeWardrobeActionId: 'outfit-night',
+      actions: [
+        {
+          id: 'outfit-night', kind: 'expression', name: 'night', file: 'night.exp3.json',
+          tags: [], permission: 'manual', wardrobe: true,
+          parameterValues: [{ id: 'ParamWatermark', value: 0, blend: 'Overwrite' }],
+        },
+      ],
+    } as unknown as Live2DAvatarConfig;
+
+    expect(getActiveLive2DWardrobeParameters(config)).toEqual([
+      { id: 'ParamWatermark', value: 0, blend: 'Overwrite' },
+    ]);
+    expect(getActiveLive2DWardrobeParameters({ ...config, activeWardrobeActionId: undefined })).toEqual([]);
+  });
+
+  it('只读文件头即可识别超大贴图，并按最长边 4096 等比计算降档尺寸', async () => {
+    expect(await readLive2DTextureDimensions(pngHeader(8192, 4096))).toEqual({
+      width: 8192,
+      height: 4096,
+      mimeType: 'image/png',
+    });
+    expect(getLive2DTextureResizeTarget(8192, 4096)).toEqual({ width: 4096, height: 2048 });
+    expect(getLive2DTextureResizeTarget(2048, 4096)).toBeNull();
+  });
+
+  it('导入模型默认使用 2K 运行纹理，并允许显式切到 4K', () => {
+    const base = { format: 'live2d', textureQuality: undefined } as Live2DAvatarConfig;
+    expect(getLive2DTextureQuality(base)).toBe('balanced');
+    expect(getLive2DTextureMaxDimension(base)).toBe(2048);
+    expect(getLive2DTextureQuality({ ...base, textureQuality: 'hd' })).toBe('hd');
+    expect(getLive2DTextureMaxDimension({ ...base, textureQuality: 'hd' })).toBe(4096);
+  });
+
+  it('导入时自动降档模型引用的超大贴图，并关闭临时位图释放解码内存', async () => {
+    const close = vi.fn();
+    const createBitmap = vi.fn(async () => ({ width: 4096, height: 2048, close }));
+    const drawImage = vi.fn();
+    class MockOffscreenCanvas {
+      constructor(public width: number, public height: number) {}
+      getContext() { return { drawImage }; }
+      async convertToBlob(options: { type: string }) {
+        return new Blob(['resized'], { type: options.type });
+      }
+    }
+    vi.stubGlobal('createImageBitmap', createBitmap);
+    vi.stubGlobal('OffscreenCanvas', MockOffscreenCanvas);
+
+    const original = pngHeader(8192, 4096);
+    const progress = vi.fn();
+    const result = await downscaleOversizedLive2DTextures(
+      [{ path: 'Model/texture.png', blob: original }],
+      ['Model/texture.png'],
+      progress,
+    );
+
+    expect(createBitmap).toHaveBeenCalledWith(expect.any(Blob), expect.objectContaining({
+      resizeWidth: 4096,
+      resizeHeight: 2048,
+      resizeQuality: 'high',
+    }));
+    expect(drawImage).toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(result.entries[0].blob).not.toBe(original);
+    expect(result.entries[0].blob.type).toBe('image/png');
+    expect(result.resizedTextures).toEqual([expect.objectContaining({
+      path: 'Model/texture.png',
+      fromWidth: 8192,
+      toWidth: 4096,
+      toHeight: 2048,
+    })]);
+    expect(progress).toHaveBeenCalledWith(expect.stringContaining('8192×4096'));
+  });
+
+  it('手机支持 WebCodecs 时按 2K 目标流式解码，不先展开 8K 位图', async () => {
+    const frameClose = vi.fn();
+    const decoderClose = vi.fn();
+    const decoderInit = vi.fn();
+    class MockImageDecoder {
+      constructor(init: ImageDecoderInit) { decoderInit(init); }
+      async decode() { return { complete: true, image: { close: frameClose } }; }
+      close() { decoderClose(); }
+    }
+    class MockOffscreenCanvas {
+      constructor(public width: number, public height: number) {}
+      getContext() { return { drawImage: vi.fn() }; }
+      async convertToBlob(options: { type: string }) {
+        return new Blob(['webcodecs-2k'], { type: options.type });
+      }
+    }
+    const createBitmap = vi.fn();
+    vi.stubGlobal('ImageDecoder', MockImageDecoder);
+    vi.stubGlobal('createImageBitmap', createBitmap);
+    vi.stubGlobal('OffscreenCanvas', MockOffscreenCanvas);
+
+    const result = await downscaleOversizedLive2DTextures(
+      [{ path: 'Model/texture.png', blob: pngHeader(8192, 4096) }],
+      ['Model/texture.png'],
+      undefined,
+      2048,
+    );
+
+    expect(decoderInit).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'image/png',
+      desiredWidth: 2048,
+      desiredHeight: 1024,
+    }));
+    expect(createBitmap).not.toHaveBeenCalled();
+    expect(frameClose).toHaveBeenCalledOnce();
+    expect(decoderClose).toHaveBeenCalledOnce();
+    expect(await result.entries[0].blob.text()).toBe('webcodecs-2k');
   });
 
 });

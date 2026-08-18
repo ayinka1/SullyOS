@@ -1,23 +1,41 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Application, Assets, Cache, extensions } from 'pixi.js';
 import { AvatarAutonomy, getViewerEyeContactCompensation } from '../../utils/avatarAutonomy';
 import { DEFAULT_AVATAR_PERFORMANCE, type AvatarPerformanceDirection, type AvatarStageFraming } from '../../utils/avatarPerformance';
 import type { CallAudioFeed } from '../../utils/callAudioFeed';
 import { isDevDebugAvailable } from '../../utils/devDebug';
-import { bridgeCubism6RenderOrders, ensureLive2DCubismCore, preloadLive2DRuntime } from '../../utils/live2dCore';
+import {
+  combineLive2DMouthForm,
+  DEFAULT_LIVE2D_MOUTH_FORM_PARAMETER,
+  DEFAULT_LIVE2D_MOUTH_OPEN_PARAMETER,
+  resolveLive2DMouthFrame,
+  splitLive2DLipSyncParameters,
+} from '../../utils/live2dLipSync';
+import {
+  bridgeCubism6RenderOrders,
+  enableCubism5HighPrecisionMasks,
+  ensureLive2DCubismCore,
+  preloadLive2DRuntime,
+} from '../../utils/live2dCore';
 import {
   buildLive2DPerformanceMix,
   findLive2DActionsForPerformance,
+  getActiveLive2DWardrobeParameters,
   loadLive2DModelSource,
   type Live2DAction,
+  type Live2DActionParameterValue,
   type Live2DAvatarConfig,
 } from '../../utils/live2dModelStore';
 import type { AvatarMotionState } from './VRMAvatarCanvas';
 import {
+  avatarTouchZoneToastLabel,
+  resolveAvatarTouchRegion,
   resolveAvatarTouchTarget,
   type AvatarTouchHit,
   type AvatarTouchRequest,
+  type AvatarTouchZone,
 } from '../../utils/avatarTouch';
+import type { AvatarTouchRegion } from '../../types';
 
 export interface Live2DActionTrigger {
   id: string;
@@ -48,12 +66,19 @@ interface Live2DAvatarCanvasProps {
   /** 高质量模式才启用保守的多层动作混合；基础/手动播放路径保持原样。 */
   performanceQuality?: 'basic' | 'high';
   manualAction?: Live2DActionTrigger | null;
+  /** Keep the user's selected wardrobe expression as a persistent parameter layer. */
+  preserveActiveWardrobe?: boolean;
   onLoadingChange?: (loading: boolean, stage?: string) => void;
   onError?: (message: string) => void;
   onReady?: () => void;
   touchRequest?: AvatarTouchRequest | null;
   touchImpulseNonce?: number;
   onAvatarTouch?: (hit: AvatarTouchHit) => void;
+  /** Optional draft override while editing; otherwise config.touchRegions is used. */
+  touchRegions?: AvatarTouchRegion[];
+  /** Enables model-local ellipse drawing for one reaction zone. */
+  touchRegionEditingZone?: AvatarTouchZone;
+  onTouchRegionsChange?: (regions: AvatarTouchRegion[]) => void;
   /** Desktop companion mode caps rendering work while preserving interaction. */
   maxFps?: number;
   /** Pins parameters to target values while the advanced editor shows its target state. */
@@ -70,6 +95,14 @@ const registerLive2DPlugin = (plugin: Parameters<typeof extensions.add>[0]) => {
 };
 
 const clamp = (value: number, min = -1, max = 1): number => Math.max(min, Math.min(max, value));
+const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
+const TOUCH_REGION_COLORS: Record<AvatarTouchZone, string> = {
+  head: '#f5c86a',
+  face: '#ff8fb7',
+  hand: '#77d9dd',
+  body: '#9ba8ff',
+  other: '#c6cbd5',
+};
 const HEAD_LOCK_PARAMETER_IDS = [
   'xin', 'yin', 'zin',
   'ParamAngleX', 'ParamAngleY', 'ParamAngleZ',
@@ -176,6 +209,58 @@ interface TextureLease {
 
 const textureLeases = new Map<string, TextureLease>();
 
+export const isMobileLive2DRuntime = (): boolean => {
+  if (typeof navigator === 'undefined') return false;
+  const nav = navigator as Navigator & { userAgentData?: { mobile?: boolean } };
+  if (nav.userAgentData?.mobile === true || /Android|iPhone|iPad|iPod|Mobile/i.test(nav.userAgent)) return true;
+  return nav.maxTouchPoints > 1
+    && typeof matchMedia === 'function'
+    && matchMedia('(pointer: coarse)').matches;
+};
+
+export const getLive2DCubismMemorySizeMB = (mobile = isMobileLive2DRuntime()): number => mobile ? 32 : 64;
+export const getLive2DTextureReleaseDelayMs = (mobile = isMobileLive2DRuntime()): number => mobile ? 1_000 : 8_000;
+
+const isUsableLive2DTexture = (texture: any): boolean => Boolean(
+  texture?.source
+  && !texture.destroyed
+  && !texture.source.destroyed,
+);
+
+const resetInvalidLive2DTextureAsset = async (url: string): Promise<void> => {
+  try {
+    await Assets.unload(url);
+  } catch {
+    if (Cache.has(url)) Cache.remove(url);
+  }
+  if (Assets.resolver.hasKey(url)) Assets.resolver.removeAlias(url);
+};
+
+export const prepareLive2DTextureAssets = async (urls: string[]): Promise<void> => {
+  await Promise.all(urls.map(async (url, index) => {
+    const cached = Cache.has(url) ? Cache.get<any>(url) : null;
+    if (isUsableLive2DTexture(cached)) return;
+    if (Cache.has(url) || Assets.resolver.hasKey(url)) {
+      await resetInvalidLive2DTextureAsset(url);
+    }
+
+    // Blob URLs have no path extension. Pixi's automatic parser detection
+    // therefore returns null even when a filename is placed in the fragment,
+    // because its path helper strips `#...` first. Pin the parser explicitly.
+    Assets.add({
+      alias: url,
+      src: url,
+      parser: 'texture',
+      data: { autoGenerateMipmaps: false },
+    });
+    const texture = await Assets.load<any>(url);
+    if (isUsableLive2DTexture(texture)) return;
+
+    await resetInvalidLive2DTextureAsset(url);
+    throw new Error(`Live2D 贴图 ${index + 1} 解码失败，渲染器未返回有效纹理。`);
+  }));
+};
+
 const acquireTextureLeases = (urls: string[]) => {
   urls.forEach(url => {
     const lease = textureLeases.get(url) || { users: 0, cleanupTimer: null };
@@ -198,9 +283,9 @@ const releaseTextureLeases = (urls: string[]) => {
     if (!lease) return;
     lease.users = Math.max(0, lease.users - 1);
     if (lease.users > 0 || lease.cleanupTimer !== null) return;
-    // Keep the decoded texture briefly across settings-preview -> call-stage
-    // transitions. If nobody claims it, unload after the grace period so an 8K
-    // texture does not stay on the GPU for the whole session. Must go through
+    // Keep the decoded texture only briefly across preview -> stage transitions.
+    // A 30-second grace period used to retain every recently opened atlas and
+    // could exhaust a mobile WebView after switching models a few times. Must go through
     // Assets.unload：手动 destroy 只清 Cache，Assets 的 promise 缓存还留着，
     // 下次同一 URL 会拿到已销毁的贴图。
     lease.cleanupTimer = window.setTimeout(() => {
@@ -213,7 +298,7 @@ const releaseTextureLeases = (urls: string[]) => {
         }
       });
       textureLeases.delete(url);
-    }, 30_000);
+    }, getLive2DTextureReleaseDelayMs());
   });
 };
 
@@ -228,12 +313,16 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   performance,
   performanceQuality = 'basic',
   manualAction,
+  preserveActiveWardrobe = false,
   onLoadingChange,
   onError,
   onReady,
   touchRequest,
   touchImpulseNonce,
   onAvatarTouch,
+  touchRegions,
+  touchRegionEditingZone,
+  onTouchRegionsChange,
   maxFps,
   parameterPreview,
   onParametersDiscovered,
@@ -249,10 +338,14 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   const touchImpulseNonceRef = useRef(touchImpulseNonce);
   const performanceQualityRef = useRef(performanceQuality);
   const actionParameterIdsRef = useRef<Record<string, string[]>>({});
+  const actionParameterValuesRef = useRef<Record<string, Live2DActionParameterValue[]>>({});
+  const preserveActiveWardrobeRef = useRef(preserveActiveWardrobe);
   const onLoadingChangeRef = useRef(onLoadingChange);
   const onErrorRef = useRef(onError);
   const onReadyRef = useRef(onReady);
   const onAvatarTouchRef = useRef(onAvatarTouch);
+  const touchRegionsRef = useRef<AvatarTouchRegion[]>(touchRegions ?? config.touchRegions ?? []);
+  const onTouchRegionsChangeRef = useRef(onTouchRegionsChange);
   const onParametersDiscoveredRef = useRef(onParametersDiscovered);
   const parameterPreviewRef = useRef(parameterPreview);
   // 进行中的参数动作叠加（kind='params'）：短暂把一组参数推到目标值再淡出。
@@ -261,6 +354,16 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   const directedHeadPoseRef = useRef<{ headX: number; headY: number; headZ: number } | null>(null);
   const framingRef = useRef(framing || config.framing || { scale: 1, offsetX: 0, offsetY: 0 });
   const faceFramingRef = useRef<AvatarStageFraming | undefined>(faceFraming || config.faceFraming);
+  const [touchRegionBounds, setTouchRegionBounds] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  const touchRegionBoundsRef = useRef<typeof touchRegionBounds>(null);
+  const [drawingTouchRegion, setDrawingTouchRegion] = useState<AvatarTouchRegion | null>(null);
+  const touchRegionPointerRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    currentX: number;
+    currentY: number;
+  } | null>(null);
   const aiExpressionActiveRef = useRef(false);
   const pointerRef = useRef({ x: 0, y: 0, active: false, lastMoved: 0 });
   const lipSyncKey = config.lipSyncParameterIds.join('\u0000');
@@ -312,10 +415,13 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   useEffect(() => { performanceRef.current = performance; }, [performance]);
   useEffect(() => { touchImpulseNonceRef.current = touchImpulseNonce; }, [touchImpulseNonce]);
   useEffect(() => { performanceQualityRef.current = performanceQuality; }, [performanceQuality]);
+  useEffect(() => { preserveActiveWardrobeRef.current = preserveActiveWardrobe; }, [preserveActiveWardrobe]);
   useEffect(() => { onLoadingChangeRef.current = onLoadingChange; }, [onLoadingChange]);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
   useEffect(() => { onReadyRef.current = onReady; }, [onReady]);
   useEffect(() => { onAvatarTouchRef.current = onAvatarTouch; }, [onAvatarTouch]);
+  useEffect(() => { touchRegionsRef.current = touchRegions ?? config.touchRegions ?? []; }, [touchRegions, config.touchRegions]);
+  useEffect(() => { onTouchRegionsChangeRef.current = onTouchRegionsChange; }, [onTouchRegionsChange]);
   useEffect(() => { onParametersDiscoveredRef.current = onParametersDiscovered; }, [onParametersDiscovered]);
   useEffect(() => { parameterPreviewRef.current = parameterPreview; }, [parameterPreview]);
   useEffect(() => {
@@ -325,6 +431,135 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   useEffect(() => {
     faceFramingRef.current = faceFraming || config.faceFraming;
   }, [faceFraming, config.faceFraming]);
+
+  useEffect(() => {
+    if (!touchRegionEditingZone) {
+      touchRegionBoundsRef.current = null;
+      setTouchRegionBounds(null);
+      setDrawingTouchRegion(null);
+      touchRegionPointerRef.current = null;
+      return;
+    }
+    let frame = 0;
+    const updateBounds = () => {
+      const bounds = (modelRef.current as any)?.getBounds?.();
+      if (bounds?.width > 0 && bounds?.height > 0) {
+        const next = { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+        const previous = touchRegionBoundsRef.current;
+        if (
+          !previous
+          || Math.abs(previous.x - next.x) > 0.5
+          || Math.abs(previous.y - next.y) > 0.5
+          || Math.abs(previous.width - next.width) > 0.5
+          || Math.abs(previous.height - next.height) > 0.5
+        ) {
+          touchRegionBoundsRef.current = next;
+          setTouchRegionBounds(next);
+        }
+      }
+      frame = window.requestAnimationFrame(updateBounds);
+    };
+    frame = window.requestAnimationFrame(updateBounds);
+    return () => window.cancelAnimationFrame(frame);
+  }, [touchRegionEditingZone, config.assetId]);
+
+  const touchRegionPoint = (event: React.PointerEvent<HTMLDivElement>): { x: number; y: number } | null => {
+    const host = hostRef.current;
+    const bounds = touchRegionBoundsRef.current;
+    if (!host || !bounds?.width || !bounds.height) return null;
+    const rect = host.getBoundingClientRect();
+    return {
+      x: clamp01((event.clientX - rect.left - bounds.x) / bounds.width),
+      y: clamp01((event.clientY - rect.top - bounds.y) / bounds.height),
+    };
+  };
+
+  const draftTouchRegion = (
+    zone: AvatarTouchZone,
+    startX: number,
+    startY: number,
+    currentX: number,
+    currentY: number,
+  ): AvatarTouchRegion => ({
+    id: '__drawing__',
+    zone,
+    shape: 'ellipse',
+    x: (Math.min(startX, currentX) + Math.max(startX, currentX)) / 2,
+    y: (Math.min(startY, currentY) + Math.max(startY, currentY)) / 2,
+    width: Math.abs(currentX - startX),
+    height: Math.abs(currentY - startY),
+  });
+
+  const handleTouchRegionPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!touchRegionEditingZone || (event.button !== 0 && event.pointerType === 'mouse')) return;
+    const point = touchRegionPoint(event);
+    const bounds = touchRegionBoundsRef.current;
+    const host = hostRef.current?.getBoundingClientRect();
+    if (!point || !bounds || !host) return;
+    const localX = event.clientX - host.left;
+    const localY = event.clientY - host.top;
+    if (localX < bounds.x || localX > bounds.x + bounds.width || localY < bounds.y || localY > bounds.y + bounds.height) return;
+    touchRegionPointerRef.current = {
+      pointerId: event.pointerId,
+      startX: point.x,
+      startY: point.y,
+      currentX: point.x,
+      currentY: point.y,
+    };
+    setDrawingTouchRegion(draftTouchRegion(touchRegionEditingZone, point.x, point.y, point.x, point.y));
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+
+  const handleTouchRegionPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const pointer = touchRegionPointerRef.current;
+    if (!pointer || pointer.pointerId !== event.pointerId || !touchRegionEditingZone) return;
+    const point = touchRegionPoint(event);
+    if (!point) return;
+    pointer.currentX = point.x;
+    pointer.currentY = point.y;
+    setDrawingTouchRegion(draftTouchRegion(
+      touchRegionEditingZone,
+      pointer.startX,
+      pointer.startY,
+      pointer.currentX,
+      pointer.currentY,
+    ));
+  };
+
+  const finishTouchRegion = (event: React.PointerEvent<HTMLDivElement>, save: boolean) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const pointer = touchRegionPointerRef.current;
+    if (!pointer || pointer.pointerId !== event.pointerId || !touchRegionEditingZone) return;
+    const point = touchRegionPoint(event);
+    if (point) {
+      pointer.currentX = point.x;
+      pointer.currentY = point.y;
+    }
+    const draft = draftTouchRegion(
+      touchRegionEditingZone,
+      pointer.startX,
+      pointer.startY,
+      pointer.currentX,
+      pointer.currentY,
+    );
+    touchRegionPointerRef.current = null;
+    setDrawingTouchRegion(null);
+    if (!save || draft.width < 0.025 || draft.height < 0.025) return;
+    const region: AvatarTouchRegion = {
+      ...draft,
+      id: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `touch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    };
+    const next = [...touchRegionsRef.current, region];
+    touchRegionsRef.current = next;
+    onTouchRegionsChangeRef.current?.(next);
+  };
 
   useEffect(() => {
     if (!touchRequest) return;
@@ -352,12 +587,15 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
       }
     } catch { /* ignore invalid first-frame bounds */ }
     if (!insideBounds) return;
-    const target = resolveAvatarTouchTarget(rawAreas, fallbackY, fallbackX);
+    const customTarget = resolveAvatarTouchRegion(touchRegionsRef.current, fallbackX, fallbackY);
+    const target = customTarget
+      ? { zone: customTarget.zone, part: customTarget.part }
+      : resolveAvatarTouchTarget(rawAreas, fallbackY, fallbackX);
     onAvatarTouchRef.current?.({
       ...touchRequest,
       ...target,
-      source: rawAreas.length ? 'live2d-hit-area' : 'live2d-bounds',
-      rawAreas,
+      source: customTarget ? 'live2d-custom-region' : rawAreas.length ? 'live2d-hit-area' : 'live2d-bounds',
+      rawAreas: customTarget ? [`custom:${customTarget.regionId}`, ...rawAreas] : rawAreas,
     });
   }, [touchRequest]);
 
@@ -453,7 +691,8 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           // pointer controllers while leaving head/body/physics animation intact.
           ignoreParamIds: [...new Set([
             ...configRef.current.lipSyncParameterIds,
-            'ParamMouthOpenY',
+            DEFAULT_LIVE2D_MOUTH_OPEN_PARAMETER,
+            DEFAULT_LIVE2D_MOUTH_FORM_PARAMETER,
             'ParamEyeBallX',
             'ParamEyeBallY',
             ...(headMotionLockedRef.current && !directedHead.enabled ? HEAD_LOCK_PARAMETER_IDS : []),
@@ -566,6 +805,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
 
     const boot = async () => {
       const bootStartedAt = window.performance.now();
+      const mobileRuntime = isMobileLive2DRuntime();
       // 模型包读取/解包/贴图转码只碰 IndexedDB 和 FileReader，与引擎完全无关。
       // 提前并行发起，引擎脚本加载 + Pixi 初始化期间磁盘 IO 与解码同时进行，
       // 首屏耗时从「两段相加」变成「取较慢的一段」。
@@ -579,13 +819,19 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         onLoadingChangeRef.current?.(true, '引擎已就绪，正在准备 Live2D 渲染器…');
         const { configureCubismSDK, Live2DModel, Live2DPlugin } = await preloadLive2DRuntime();
         registerLive2DPlugin(Live2DPlugin as Parameters<typeof extensions.add>[0]);
-        configureCubismSDK({ memorySizeMB: 128 });
+        // The stage renders a single model. Reserving 128 MB for Cubism's
+        // internal update heap before textures were even uploaded was wasteful
+        // on phones; 32 MB keeps a 2x safety margin over the SDK minimum.
+        configureCubismSDK({ memorySizeMB: getLive2DCubismMemorySizeMB(mobileRuntime) });
 
         app = new Application();
         await app.init({
           resizeTo: host,
           backgroundAlpha: 0,
-          antialias: true,
+          // Live2D atlas edges are already alpha-antialiased. Disabling WebGL
+          // MSAA on mobile avoids an extra multisampled framebuffer without
+          // reducing atlas resolution.
+          antialias: !mobileRuntime,
           autoDensity: true,
           resolution: Math.min(window.devicePixelRatio || 1, 2),
           preference: 'webgl',
@@ -622,20 +868,28 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         cleanupPackage = source.cleanup;
         packageTextureUrls = source.textureUrls;
         actionParameterIdsRef.current = source.actionParameterIds;
+        actionParameterValuesRef.current = source.actionParameterValues;
         if (disposed) {
           releasePackage();
           return;
         }
         acquireTextureLeases(packageTextureUrls);
         texturesLeased = true;
+
+        onLoadingChangeRef.current?.(true, '正在解码 Live2D 贴图…');
+        await prepareLive2DTextureAssets(packageTextureUrls);
+        if (disposed) return;
+
         onLoadingChangeRef.current?.(true, '缓存已就绪，正在创建 Cubism 角色…');
         const cubismStartedAt = window.performance.now();
         const model = await Live2DModel.from(source.settings as any, {
           idleMotionGroup: 'Idle',
-          // preferCreateImageBitmap:false → 贴图走主线程 <img> 解码。worker 里
-          // fetch 巨型 data URL（8K 贴图 base64 上百 MB）是 Pixi 的经典翻车点，
-          // 表现就是 [Loader.load] Failed to load。
-          textureOptions: { lod: 'full', preferCreateImageBitmap: false } as any,
+          // Full mip chains add another ~33% GPU allocation per atlas. The
+          // model already uses the selected source resolution, so linear
+          // sampling without generated mipmaps preserves detail and memory.
+          // Texture sources are Blob URLs now, allowing Pixi's bitmap loader
+          // instead of the old main-thread Base64 <img> path.
+          textureOptions: { lod: false } as any,
           ticker: app.ticker,
           autoUpdate: true,
           // We provide our own DOM pointer-to-gaze controller and action chips,
@@ -644,7 +898,14 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           autoFocus: false,
         });
         const cubismMs = window.performance.now() - cubismStartedAt;
+        const invalidTextureIndex = ((model as any).textures as any[] | undefined)
+          ?.findIndex(texture => !isUsableLive2DTexture(texture)) ?? -1;
+        if (invalidTextureIndex >= 0) {
+          model.destroy({ children: true, texture: false });
+          throw new Error(`Live2D 贴图 ${invalidTextureIndex + 1} 加载为空，已阻止进入渲染阶段。`);
+        }
         const cubismCoreCompatibility = bridgeCubism6RenderOrders(model);
+        const cubismMaskCompatibility = enableCubism5HighPrecisionMasks(model);
         if (disposed || !app) {
           model.destroy({ children: true, texture: true });
           return;
@@ -742,6 +1003,18 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
             return undefined;
           }
         };
+        const lipSyncParameters = splitLive2DLipSyncParameters(configRef.current.lipSyncParameterIds);
+        const mouthOpenParameterIds = lipSyncParameters.mouthOpen.filter(hasParameter);
+        if (!mouthOpenParameterIds.length && hasParameter(DEFAULT_LIVE2D_MOUTH_OPEN_PARAMETER)) {
+          mouthOpenParameterIds.push(DEFAULT_LIVE2D_MOUTH_OPEN_PARAMETER);
+        }
+        const mouthFormParameterIds = lipSyncParameters.mouthForm.filter(hasParameter);
+        if (
+          hasParameter(DEFAULT_LIVE2D_MOUTH_FORM_PARAMETER)
+          && !mouthFormParameterIds.includes(DEFAULT_LIVE2D_MOUTH_FORM_PARAMETER)
+        ) {
+          mouthFormParameterIds.push(DEFAULT_LIVE2D_MOUTH_FORM_PARAMETER);
+        }
         // VTube exports are not always all-or-nothing. Some nine-axis rigs keep
         // only a subset of xin/yin/zin + xinb/yinb/zinb, so detect each channel
         // independently instead of disabling the entire tracking path when one
@@ -767,6 +1040,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         // 自定义参数动作的底值记录：叠加淡出后参数要精确回到模型自身的值。
         const overlayBases: Record<string, { base: number; lastFinal: number }> = {};
         const pinnedPreviewBases: Record<string, { base: number; lastFinal: number }> = {};
+        const wardrobeBases: Record<string, { base: number; lastFinal: number }> = {};
         const overlayBlend = (id: string, target: number, weight: number) => {
           const resolved = resolveId(id);
           const currentValue = core.getParameterValueById(resolved);
@@ -797,6 +1071,40 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
             }
             delete pinnedPreviewBases[id];
           });
+        };
+        const applyPersistentWardrobe = () => {
+          const targets = preserveActiveWardrobeRef.current
+            ? getActiveLive2DWardrobeParameters(configRef.current, actionParameterValuesRef.current)
+            : [];
+          const activeIds = new Set<string>();
+          targets.forEach(({ id, value, blend = 'Add' }) => {
+            if (!hasParameter(id) || !Number.isFinite(value)) return;
+            activeIds.add(id);
+            const resolved = resolveId(id);
+            const currentValue = core.getParameterValueById(resolved);
+            const previous = wardrobeBases[id];
+            const base = previous && Math.abs(currentValue - previous.lastFinal) < 1e-4
+              ? previous.base
+              : currentValue;
+            const next = blend === 'Overwrite'
+              ? value
+              : blend === 'Multiply' ? base * value : base + value;
+            core.setParameterValueById(resolved, next);
+            wardrobeBases[id] = { base, lastFinal: core.getParameterValueById(resolved) };
+          });
+          Object.keys(wardrobeBases).forEach(id => {
+            if (activeIds.has(id)) return;
+            const resolved = resolveId(id);
+            const previous = wardrobeBases[id];
+            const currentValue = core.getParameterValueById(resolved);
+            if (Math.abs(currentValue - previous.lastFinal) < 1e-4) {
+              core.setParameterValueById(resolved, previous.base);
+            }
+            delete wardrobeBases[id];
+          });
+          if (host.dataset.live2dWardrobe !== configRef.current.activeWardrobeActionId) {
+            host.dataset.live2dWardrobe = configRef.current.activeWardrobeActionId || '';
+          }
         };
 
         // 把模型全部参数（id/范围/默认值）回传给设置面板，驱动 VTS 风格的
@@ -897,18 +1205,17 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           if (debugFrameDatasets) host.dataset.live2dBlink = frame.blink.toFixed(3);
           // 优先用逐帧音频信号驱动口型；只有拿不到实时信号（未配语音 / CORS
           // 音频接不进 WebAudio）才退回节奏型假口型，绝不在两者之间逐帧横跳。
-          let mouth = 0;
-          if (speaking) {
-            if (lip?.active) {
-              mouth = clamp(lip.level * 1.1, 0, 1);
-            } else {
-              const rhythm = clamp(0.16 + Math.sin(t * 13.1) * 0.35 + Math.sin(t * 21.7 + 0.8) * 0.2, 0, 0.82);
-              const phraseGate = Math.sin(t * 3.15) > -0.72 ? 1 : 0.08;
-              mouth = rhythm * phraseGate;
-            }
-          }
+          // MouthOpenY receives amplitude only; MouthForm receives the independent
+          // round-to-wide vowel axis. Without analyser data, both signals remain
+          // synthetic instead of reducing a capable rig to simple open/close flaps.
+          const mouthFrame = resolveLive2DMouthFrame(speaking, lip, t);
+          const mouth = mouthFrame.open;
           lastMouthLevel = mouth;
-          if (debugFrameDatasets) host.dataset.live2dMouthLevel = mouth.toFixed(3);
+          if (debugFrameDatasets) {
+            host.dataset.live2dMouthLevel = mouth.toFixed(3);
+            host.dataset.live2dMouthForm = mouthFrame.form.toFixed(3);
+            host.dataset.live2dMouthSource = mouthFrame.source;
+          }
 
           const pinsAutonomyPose = Boolean(direction?.precision?.lockAutonomy);
           if (usesVTubeTrackingInputs) {
@@ -969,7 +1276,14 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           const faceHold = Math.min(1, 0.55 + faceIntensity * 0.45)
             * (speaking ? 1 : Math.exp(-Math.max(0, sinceDirection - 2.8) / 2.6));
           const faceW = (name: string) => (faceSet.has(name as never) ? faceHold : 0);
-          smooth('ParamMouthForm', faceW('grin') - faceW('pout'), 0.22, true);
+          const expressionMouthForm = faceW('grin') - faceW('pout');
+          const combinedMouthForm = combineLive2DMouthForm(mouthFrame.form, expressionMouthForm);
+          const mouthFormSpeed = mouthFrame.source === 'synthetic' ? 0.12 : 0.22;
+          for (const id of mouthFormParameterIds) {
+            // Add to the expression/motion-authored base. Writing an absolute
+            // vowel value here would erase the model's smile or pout.
+            smooth(id, combinedMouthForm, mouthFormSpeed, true);
+          }
           smooth('ParamCheek', faceW('blush'), 0.18, true);
           // 眉眼系：眯眯笑眼走标准笑眼参数；眉毛用高度/形状/角度组合近似
           // 挑眉、八字眉、皱眉（各模型绑法不同，追求"方向对"而非像素级精确）。
@@ -990,7 +1304,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           const eyesClosed = faceW('eyes-closed');
           smooth('ParamEyeLOpen', -clamp(frame.blink + eyesClosed + smileEyes * 0.35, 0, 1), 0.62, true);
           smooth('ParamEyeROpen', -clamp(frame.blink + eyesClosed + smileEyes * 0.35 + faceW('wink'), 0, 1), 0.62, true);
-          for (const id of config.lipSyncParameterIds.length ? config.lipSyncParameterIds : ['ParamMouthOpenY']) {
+          for (const id of mouthOpenParameterIds) {
             smooth(id, mouth, speaking ? 0.42 : 0.25);
           }
 
@@ -1014,6 +1328,10 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           // A playable action fades by design; the editor instead needs a
           // sustained before/after state so every slider movement is visible.
           applyPinnedPreview(parameterPreviewRef.current || []);
+          // Wardrobe is a user-owned persistent layer. It runs after motions,
+          // AI expressions and touch overlays so none of them can expose the
+          // model's watermarked/default art by resetting the expression manager.
+          applyPersistentWardrobe();
           // Final writer wins: our call-style autonomy, audio accents and custom
           // parameter overlays have all run by this point. During companion
           // startup, erase every head output we own on every frame.
@@ -1063,10 +1381,11 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           if (hasParameter('ParamEyeBallX')) core.setParameterValueById(resolveId('ParamEyeBallX'), finalEyeX);
           if (hasParameter('ParamEyeBallY')) core.setParameterValueById(resolveId('ParamEyeBallY'), finalEyeY);
           // Motions, focus and physics can all run after afterMotionUpdate and
-          // overwrite the synthetic no-audio mouth. Write the call-owned mouth
-          // at the same final stage as gaze so text-only speech stays visible.
+          // overwrite the synthetic no-audio opening. The final layer therefore
+          // pins opening parameters only. MouthForm must retain the additive
+          // vowel + expression result written above.
           const finalMouth = motionStateRef.current === 'speaking' ? lastMouthLevel : 0;
-          for (const id of config.lipSyncParameterIds.length ? config.lipSyncParameterIds : ['ParamMouthOpenY']) {
+          for (const id of mouthOpenParameterIds) {
             if (hasParameter(id)) core.setParameterValueById(resolveId(id), finalMouth);
           }
           if (debugFrameDatasets) {
@@ -1120,14 +1439,25 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           // 用户锚定过脸部时，特写镜头直接落到锚点构图，不再用启发式偏移猜脸的位置。
           const anchored = closeShot && faceFramingRef.current ? faceFramingRef.current : null;
           const framing = anchored || framingRef.current;
+          // On the always-on desktop, a generic full-body heuristic is more
+          // dangerous than useful: one face tap used to enlarge the model and
+          // push it down by 10% of the screen, which can move tall imports
+          // completely offstage. Until the user saves a face anchor, keep the
+          // desktop's calibrated composition perfectly still.
+          const suppressUnanchoredCloseShot = closeShot
+            && ambientAutonomyDisabledRef.current
+            && !anchored
+            && !configRef.current.builtIn;
           // 导演机位只在用户构图基础上做温和加减：medium 必须是 1.0，
           // 否则用户校准好的构图会被默认镜头永久放大。锚定后特写倍率交给锚点本身。
           const cameraScale = anchored
             ? 1
+            : suppressUnanchoredCloseShot
+              ? 1
             : closeShot
               ? 1.22
               : direction?.camera === 'wide' || direction?.camera === 'pull-out' ? 0.88 : 1;
-          const cameraYOffset = anchored ? 0 : closeShot ? 0.1 : 0;
+          const cameraYOffset = anchored || suppressUnanchoredCloseShot ? 0 : closeShot ? 0.1 : 0;
           const cameraX = base.x + app.screen.width * framing.offsetX;
           const cameraY = base.y + app.screen.height * (framing.offsetY + cameraYOffset);
           const frame = autonomy.frame;
@@ -1161,6 +1491,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         console.info('[live2d] renderer ready', {
           assetId: config.assetId,
           offscreenCount: cubismCoreCompatibility.offscreenCount,
+          ...cubismMaskCompatibility,
           ...source.timings,
           cubismMs: Math.round(cubismMs),
           bootTotalMs: Math.round(window.performance.now() - bootStartedAt),
@@ -1225,7 +1556,66 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
     };
   }, [config.assetId, lipSyncKey, maxFps]);
 
-  return <div ref={hostRef} className="absolute inset-0 overflow-hidden" aria-label="Live2D 角色舞台" />;
+  const displayedTouchRegions = touchRegionEditingZone
+    ? [...(touchRegions ?? config.touchRegions ?? []), ...(drawingTouchRegion ? [drawingTouchRegion] : [])]
+    : [];
+
+  return (
+    <div ref={hostRef} className="absolute inset-0 overflow-hidden" aria-label="Live2D 角色舞台">
+      {touchRegionEditingZone && touchRegionBounds && (
+        <div
+          className="absolute inset-0 z-10 touch-none cursor-crosshair"
+          onPointerDown={handleTouchRegionPointerDown}
+          onPointerMove={handleTouchRegionPointerMove}
+          onPointerUp={event => finishTouchRegion(event, true)}
+          onPointerCancel={event => finishTouchRegion(event, false)}
+          data-testid="live2d-touch-region-editor"
+          aria-label={`正在圈选${avatarTouchZoneToastLabel(touchRegionEditingZone)}触摸区域`}
+        >
+          <div
+            className="pointer-events-none absolute border border-dashed border-white/30"
+            style={{
+              left: touchRegionBounds.x,
+              top: touchRegionBounds.y,
+              width: touchRegionBounds.width,
+              height: touchRegionBounds.height,
+            }}
+            aria-hidden
+          />
+          {displayedTouchRegions.map(region => {
+            const color = TOUCH_REGION_COLORS[region.zone];
+            const drawing = region.id === '__drawing__';
+            const active = region.zone === touchRegionEditingZone;
+            return (
+              <div
+                key={region.id}
+                className="pointer-events-none absolute flex items-center justify-center rounded-[50%] border"
+                style={{
+                  left: touchRegionBounds.x + (region.x - region.width / 2) * touchRegionBounds.width,
+                  top: touchRegionBounds.y + (region.y - region.height / 2) * touchRegionBounds.height,
+                  width: region.width * touchRegionBounds.width,
+                  height: region.height * touchRegionBounds.height,
+                  borderColor: color,
+                  borderStyle: drawing ? 'dashed' : 'solid',
+                  borderWidth: active ? 2 : 1,
+                  background: `${color}${active ? '28' : '12'}`,
+                  boxShadow: active ? `0 0 18px ${color}55` : undefined,
+                }}
+                data-touch-region-zone={region.zone}
+                aria-hidden
+              >
+                {region.width > 0.08 && region.height > 0.05 && (
+                  <span className="rounded-full bg-black/55 px-1.5 py-0.5 text-[8px] font-semibold text-white/90 backdrop-blur">
+                    {avatarTouchZoneToastLabel(region.zone)}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 };
 
 export default Live2DAvatarCanvas;

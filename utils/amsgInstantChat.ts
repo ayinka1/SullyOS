@@ -23,7 +23,9 @@ import { ActiveMsg2InboxMessage, CharacterProfile, GroupProfile, RealtimeConfig,
 import { ActiveMsgClient, type AmsgOutboxEntry, type InstantChatProbeOutcome } from './activeMsgClient';
 import { ActiveMsgStore } from './activeMsgStore';
 import { trackEvent } from './analytics';
+import { cloudApiCallLogId, recordCloudApiCall, settleCloudApiCall } from './apiCallLog';
 import { announceEmotionDone } from './chatGenEvents';
+import { dispatchAmsgResult } from './amsgResults';
 import { DB } from './db';
 import type { AmsgEmotionEvalSpec } from '../worker/amsg/src/emotionEval';
 
@@ -445,6 +447,16 @@ export const sendInstantChatTurn = async (params: {
 }): Promise<InstantChatSendResult> => {
   const supersedes = getInstantChatPending(params.char.id);
   inFlightSends.add(params.char.id);
+  // 这一轮在「API 调用记录」里的那一笔：本地这条路只经手一个 POST，真正的模型请求
+  // 是云端发的，日志的全局拦截器够不着——不在这儿记，用户就会看到聊天从记录里消失。
+  // meta 跟本地生成那条路对齐（useChatAI 传给 safeFetchJson 的那份），两条路在列表里
+  // 长得一样，只多一个云端标记。
+  const logMeta = {
+    appName: '消息',
+    charId: params.char.id,
+    charName: params.char.name,
+    purpose: '聊天回复',
+  };
   try {
     const { uuid } = await ActiveMsgClient.sendInstantChat({
       char: params.char,
@@ -461,15 +473,65 @@ export const sendInstantChatTurn = async (params: {
     });
     // 先记待收再释放占位（finally），挡板的两个信号无缝交接，不留「都不认」的空窗。
     setInstantChatPending(params.char.id, uuid, Date.now(), params.char.name);
+    recordCloudApiCall({
+      id: cloudApiCallLogId(uuid),
+      route: 'cloud-instant-chat',
+      baseUrl: params.api.baseUrl,
+      model: params.api.model,
+      messages: params.chatMessages,
+      meta: logMeta,
+    });
+    // 顶掉的那一轮也得收尾：客户端从这一刻起不再等它的回复了（云端把两句合成一次回，
+    // 它已经在跑的情况下顶不掉，但那份回复也认不回这条记录）。不收的话它会一直写着
+    // 「云端生成中」，直到 5 天后被裁掉。
+    if (supersedes) {
+      settleCloudApiCall({ id: cloudApiCallLogId(supersedes.uuid), ok: true, superseded: true });
+    }
     return { ok: true, uuid };
   } catch (error: any) {
     // 只报失败、只有事件名（跟送达端那几条同一条口径）：失败原因里带着 HTTP 状态和
     // 上游报文，不进上报。用户侧同一时刻已经有明确的报错提示，这里只记「发生过」。
     trackEvent('即时对话发送失败');
+    // 没交上去的这一轮同样进记录：界面上那句报错关掉就没了，而日志里留得住——
+    // 交不上去往往跟这次要发的东西有多大有关，输入构成就在这条记录里。
+    recordCloudApiCall({
+      id: `cloud-send-failed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      route: 'cloud-instant-chat',
+      baseUrl: params.api.baseUrl,
+      model: params.api.model,
+      messages: params.chatMessages,
+      meta: logMeta,
+      sendFailed: true,
+    });
     return { ok: false, error: error?.message || String(error) };
   } finally {
     inFlightSends.delete(params.char.id);
   }
+};
+
+/**
+ * 这一轮回来了 → 把「API 调用记录」里那笔挂着的补完。
+ *
+ * `metadata` 是这一轮**最后一条**推送带回来的那份：云端把用量（`amsgUsage`）和工具
+ * 痕迹（`amsgToolTrace`）都挂在末条上。补收路径拿到的是同一份（账本存的就是推送信封
+ * 的副本），所以推送丢了也照样补得上。
+ *
+ * 云端回传的用量只有**最后一次**模型调用那一份——带工具的一轮会连着调好几次模型，
+ * 中间几次的数在云端就没留下。跑过工具就把这笔标成「只算末轮」，让用户知道这个数字
+ * 偏小，别拿它去跟账单对齐。
+ */
+export const settleInstantChatApiLog = (uuid: string, metadata?: Record<string, any> | null): void => {
+  const num = (value: unknown): number | undefined =>
+    (typeof value === 'number' && Number.isFinite(value) ? value : undefined);
+  const usage = metadata?.amsgUsage;
+  const toolTrace = metadata?.amsgToolTrace;
+  settleCloudApiCall({
+    id: cloudApiCallLogId(uuid),
+    ok: true,
+    promptTokens: num(usage?.promptTokens),
+    completionTokens: num(usage?.completionTokens),
+    tokensPartial: Array.isArray(toolTrace) && toolTrace.length > 0,
+  });
 };
 
 // ─── 推送丢了的兜底：拉服务端消息账本 ───
@@ -574,9 +636,14 @@ const markOutboxAdopted = (): void => {
 /**
  * 首次接管：账本上的存量整批销账、不进聊天流。
  *
- * 唯一的例外是用户**此刻正等着的那几轮**（taskUuid 跟待收记录对得上）：那是刚刚发生
- * 的事，不是历史积压，照常走补收放进聊天流——否则第一次接管恰好赶上用户发消息时，
- * 那一轮的回复会被当存量销掉，用户等来的是一句「回复没能取回」。
+ * 两类例外照常走补收：
+ *   - 用户**此刻正等着的那几轮**（taskUuid 跟待收记录对得上）：那是刚刚发生的事，不是
+ *     历史积压——否则第一次接管恰好赶上用户发消息时，那一轮的回复会被当存量销掉，用户
+ *     等来的是一句「回复没能取回」。
+ *   - **后台任务的结果**（`messageKind: 'result'`）：它们本来就是靠补收到达的（不弹通知
+ *     的结果上游只落账本、不发推送），跟存量一起销掉的话，云端跑完的门牌整理会一声不响
+ *     地蒸发。而且它们不进聊天流，没有「重放一遍」这回事——首次接管要防的是刷屏，不是
+ *     数据落地。换设备 / 重装 PWA / 清过 localStorage 的用户走的正是这条路。
  *
  * 销账成功才记标记。没销干净就这一趟什么都不做、也不记标记：没销掉的条目下次还会
  * 拉回来，那时仍按接管处理。反过来（先记标记再销账）一旦销账失败，剩下的存量下一趟
@@ -585,7 +652,9 @@ const markOutboxAdopted = (): void => {
 const adoptOutboxBacklog = async (entries: AmsgOutboxEntry[]): Promise<OutboxDrainResult> => {
   const awaitedUuids = new Set(listInstantChatPendings().map((pending) => pending.uuid));
   const isAwaited = (entry: AmsgOutboxEntry) => !!entry.taskUuid && awaitedUuids.has(entry.taskUuid);
-  const backlogIds = entries.filter((entry) => !isAwaited(entry)).map((entry) => entry.messageId);
+  const isResult = (entry: AmsgOutboxEntry) => entry.push?.messageKind === 'result';
+  const keep = (entry: AmsgOutboxEntry) => isAwaited(entry) || isResult(entry);
+  const backlogIds = entries.filter((entry) => !keep(entry)).map((entry) => entry.messageId);
 
   if (backlogIds.length > 0) {
     try {
@@ -598,7 +667,7 @@ const adoptOutboxBacklog = async (entries: AmsgOutboxEntry[]): Promise<OutboxDra
   markOutboxAdopted();
   console.log(`${HEADER} 第一次接上云端账本：存量 ${backlogIds.length} 条直接销账，不往聊天流里放`);
 
-  const { written, ackNow } = await backfillOutboxEntries(entries.filter(isAwaited));
+  const { written, ackNow } = await backfillOutboxEntries(entries.filter(keep));
   return { written, ackNow, entries };
 };
 
@@ -608,6 +677,11 @@ const adoptOutboxBacklog = async (entries: AmsgOutboxEntry[]): Promise<OutboxDra
  * 只有正文类（`content` 与情绪结果）才往收件箱里放。思维链、工具请求、错误通知
  * 这几类补收回来已经没有意义：思维链要挂在正文上、工具请求那头的云端早就收工了、
  * 隔了一阵子的报错弹出来只会让人摸不着头脑。它们照样要销账，不然每次拉都拉回来。
+ *
+ * `result`（worker 的 emitResult 送回来的后台产物）不进收件箱——它不是聊天内容，
+ * 交给 amsgResults 按 resultKind 派活，消化成功才销账。这类结果**本来就是靠补收
+ * 到达的**：不弹通知的结果上游只落账本、不发推送，所以这条路是它唯一的入口，
+ * 跟着上面那批一起销账丢掉的话，后台跑完的东西会一声不响地全部蒸发。
  */
 const backfillOutboxEntries = async (
   entries: AmsgOutboxEntry[],
@@ -619,6 +693,15 @@ const backfillOutboxEntries = async (
   for (const entry of entries) {
     const push = entry.push || {};
     const kind = typeof push.messageKind === 'string' ? push.messageKind : 'content';
+    if (kind === 'result') {
+      // 聊天那道 24 小时的时效窗刻意不套在结果上：结果晚到本来就是常态（正是为此才上云的），
+      // 隔一天回来照样该落地，跟「隔一天才弹出来的报错」不是一回事。
+      // 但「多晚算太晚」得有人管——账本留 28 天，换设备 / 重装 PWA 的用户第一次接上账本
+      // 会把老结果一次性拉回来。这里不替各种产物定规矩，只把账本上记的时间原样交给认领
+      // 它的那一方，由它按自己的语义判（门牌整理的上限见 PLATE_RESULT_MAX_AGE_MS）。
+      if (await dispatchAmsgResult(push, { createdAt: entry.createdAt })) ackNow.push(entry.messageId);
+      continue;
+    }
     if (kind !== 'content' && kind !== 'emotion_update') {
       ackNow.push(entry.messageId);
       continue;
@@ -722,6 +805,8 @@ export const failInstantChatPending = async (
   // 只报失败、只有事件名：云端点名说这一轮没成（或回复取不回来）。这一格涨起来说明
   // 云端生成或推送链路在掉队，比用户来报「一直在输入」早得多。
   trackEvent('即时对话云端任务失败');
+  // 「API 调用记录」里那笔挂着的也收尾，否则它会一直写着「云端生成中」直到被裁掉。
+  settleCloudApiCall({ id: cloudApiCallLogId(uuid), ok: false });
   try {
     await DB.saveMessage({
       charId,

@@ -6767,7 +6767,271 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-10.3";
+var AMSG_BUNDLE_VERSION = "2026-08-15";
+
+// utils/amsgTaskKinds.ts
+var AMSG_TASK_KIND_KEY = "amsgKind";
+var readTaskKind = (metadata) => {
+  const raw = metadata?.[AMSG_TASK_KIND_KEY];
+  return typeof raw === "string" && raw ? raw : null;
+};
+var AMSG_JOB_NAMESPACE = "amsg:job";
+var AMSG_JOB_TTL_DAYS = 3;
+var AMSG_JOB_ID_KEY = "amsgJobId";
+
+// utils/memoryPalace/types.ts
+var PLATE_ROOMS = ["user_room", "self_room", "bedroom", "study"];
+var PLATE_ENTRY_CAPS = {
+  user_room: 12,
+  self_room: 10,
+  bedroom: 10,
+  study: 8
+};
+var PLATE_ENTRY_TARGET_CHARS = 50;
+var PLATE_TITLES = {
+  user_room: "TA\u7684\u4E8B",
+  self_room: "\u6211\u662F\u8C01",
+  bedroom: "\u6211\u4EEC\u4E4B\u95F4",
+  study: "\u6211\u7684\u9886\u57DF"
+};
+
+// utils/memoryPalace/jsonUtils.ts
+function safeParseJsonArray(raw) {
+  if (!raw || !raw.trim()) return [];
+  let cleaned = raw.replace(/```(?:json)?\s*/g, "").replace(/```/g, "").trim();
+  const fullMatch = cleaned.match(/\[[\s\S]*\]/);
+  if (fullMatch) {
+    try {
+      const result = JSON.parse(fullMatch[0]);
+      if (Array.isArray(result)) return result;
+    } catch {
+    }
+    try {
+      const fixed = fixBrokenJson(fullMatch[0]);
+      const result = JSON.parse(fixed);
+      if (Array.isArray(result)) return result;
+    } catch {
+    }
+    const salvaged = salvageObjects(fullMatch[0]);
+    if (salvaged.length > 0) return salvaged;
+  }
+  const openBracketIdx = cleaned.indexOf("[");
+  if (openBracketIdx >= 0) {
+    const truncated = cleaned.slice(openBracketIdx);
+    const salvaged = salvageObjects(truncated);
+    if (salvaged.length > 0) {
+      console.warn(`\u26A1 [JSON] Salvaged ${salvaged.length} objects from truncated response`);
+      return salvaged;
+    }
+  }
+  const lastResort = salvageObjects(cleaned);
+  if (lastResort.length > 0) {
+    console.warn(`\u26A1 [JSON] Last resort: salvaged ${lastResort.length} objects`);
+    return lastResort;
+  }
+  return [];
+}
+function fixBrokenJson(s) {
+  s = s.replace(/,\s*([}\]])/g, "$1");
+  s = s.replace(/'(\w+)'\s*:/g, '"$1":');
+  s = s.replace(/"([^"]*)\n([^"]*)"/g, (_, a, b) => `"${a}\\n${b}"`);
+  return s;
+}
+function salvageObjects(raw) {
+  const results = [];
+  const n = raw.length;
+  let i = 0;
+  while (i < n) {
+    const start = raw.indexOf("{", i);
+    if (start < 0) break;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+    for (let j = start; j < n; j++) {
+      const ch = raw.charCodeAt(j);
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (inString) {
+        if (ch === 92) escaped = true;
+        else if (ch === 34) inString = false;
+        continue;
+      }
+      if (ch === 34) {
+        inString = true;
+        continue;
+      }
+      if (ch === 123) depth++;
+      else if (ch === 125) {
+        depth--;
+        if (depth === 0) {
+          end = j;
+          break;
+        }
+      }
+    }
+    if (end < 0) break;
+    const candidate = raw.slice(start, end + 1);
+    i = end + 1;
+    try {
+      const obj = JSON.parse(candidate);
+      if (obj && typeof obj === "object") {
+        results.push(obj);
+        continue;
+      }
+    } catch {
+    }
+    try {
+      const obj = JSON.parse(fixBrokenJson(candidate));
+      if (obj && typeof obj === "object") {
+        results.push(obj);
+      }
+    } catch {
+    }
+  }
+  return results;
+}
+
+// utils/memoryPalace/roomPlateCore.ts
+var PLATE_LLM_TIMEOUT_MS = 12e4;
+function isPlateRoom(room) {
+  return PLATE_ROOMS.includes(room);
+}
+var ROOM_LABEL_PREFIX = {
+  user_room: "U",
+  self_room: "R",
+  bedroom: "B",
+  study: "S"
+};
+var ROOM_RULES = {
+  user_room: `\u60F3\u8C61\u4F60\u5728\u4E3A\u5BF9\u65B9\u5199\u4E00\u5F20**\u89D2\u8272\u5361**\u2014\u2014\u53EA\u6709\u5FC5\u987B\u5199\u5728\u5361\u4E0A\u7684\u5185\u5BB9\u624D\u914D\u4E0A\u8FD9\u5757\u95E8\u724C\uFF1A\u57FA\u7840\u4FE1\u606F\uFF08\u8EAB\u4EFD\u3001\u804C\u4E1A\u5927\u65B9\u5411\u3001\u5C45\u4F4F\uFF09\u3001\u5BB6\u5EAD\u7ED3\u6784\u3001\u91CD\u8981\u4ED6\u4EBA\uFF08\u4EBA\u7269\u6761\u76EE\u683C\u5F0F\u5982\u300CTA\u7684\u670B\u53CB\u5C0F\u7F8E\uFF1A\u5927\u5B66\u5BA4\u53CB\uFF0C\u5173\u7CFB\u94C1\u300D\uFF09\u3001\u957F\u671F\u76F8\u5904\u6C89\u6DC0\u4E0B\u6765\u7684\u6838\u5FC3\u4E8B\u5B9E\u3001\u4EE5\u53CA\u91CD\u5927\u5230\u8DB3\u4EE5\u5851\u9020TA\u8FD9\u4E2A\u4EBA\u7684\u4EBA\u751F\u8282\u70B9\uFF08\u4EB2\u4EBA\u79BB\u4E16\u3001\u8FC1\u5C45\u4ED6\u56FD\u8FD9\u79CD\u91CF\u7EA7\uFF09\u3002\u3010\u5165\u5361\u95E8\u69DB\u6781\u9AD8\uFF0C\u5B81\u7F3A\u6BCB\u6EE5\u3011\u9636\u6BB5\u6027\u72B6\u6001\uFF08\u6700\u8FD1\u5F88\u7D2F\u3001\u5DE5\u4F5C\u7CDF\u5FC3\uFF09\u4E0D\u6536\uFF1B\u60C5\u7EEA\u5206\u6790\u3001\u6027\u683C\u4FA7\u5199\u4E0D\u6536\u2014\u2014\u90A3\u662F\u5370\u8C61\u6863\u6848\u7684\u9886\u57DF\uFF1B\u6B63\u5728\u8FDB\u884C\u3001\u6CA1\u6709\u7ED3\u8BBA\u7684\u4E8B\u4E0D\u6536\u2014\u2014\u90A3\u662F\u4E8B\u4EF6\u76D2\u7684\u4E8B\uFF0C\u7B49\u6709\u4E86\u7ED3\u679C\u518D\u8BF4\u3002`,
+  self_room: `\u6211\u5BF9**\u81EA\u5DF1**\u7684\u7A33\u5B9A\u8BA4\u77E5\uFF1A\u6211\u662F\u8C01\u3001\u6027\u683C\u5E95\u8272\u3001\u91CD\u8981\u7684\u8F6C\u53D8\u3001\u5DF2\u7ECF\u5185\u5316\u7684\u9886\u609F\u3002\u4E0D\u6536\u5BF9\u4ED6\u4EBA\u7684\u770B\u6CD5\u3002`,
+  bedroom: `\u6211\u4EEC\u4E4B\u95F4\u7684**\u8D28\u5730**\uFF1A\u76F8\u5904\u7684\u4E60\u60EF\u4E0E\u4EEA\u5F0F\u3001\u53EA\u6709\u5F7C\u6B64\u61C2\u7684\u6897\u3001\u672A\u8A00\u660E\u7684\u9ED8\u5951\u3001\u62FF\u4E0D\u51C6\u5374\u771F\u5B9E\u7684\u611F\u89C9\u3002\u3010\u786C\u89C4\u5219\u3011\u7981\u6B62\u7ED9\u8FD9\u6BB5\u5173\u7CFB\u547D\u540D\u6216\u5206\u7C7B\u2014\u2014\u4E0D\u5F97\u5199\u51FA"\u6211\u4EEC\u662F\u604B\u4EBA/\u60C5\u4FA3/\u670B\u53CB/\u5BB6\u4EBA"\u8FD9\u7C7B\u5B9A\u4E49\u53E5\u3002\u53EA\u63CF\u8FF0\u73B0\u8C61\u548C\u611F\u53D7\uFF1B\u8BF4\u4E0D\u6E05\u3001\u4E0D\u786E\u5B9A\u672C\u8EAB\u5C31\u662F\u5408\u6CD5\u6761\u76EE\uFF08\u5982\u300C\u6211\u8BF4\u4E0D\u6E05\u6211\u4EEC\u7B97\u4EC0\u4E48\uFF0C\u4F46TA\u96BE\u8FC7\u65F6\u7B2C\u4E00\u4E2A\u627E\u7684\u662F\u6211\u300D\uFF09\u3002`,
+  study: `\u6211\u7684\u9886\u57DF\uFF1A\u6211\u4F1A\u4EC0\u4E48\u3001\u6B63\u5728\u5B66\u4EC0\u4E48\u3001\u548C\u5BF9\u65B9\u5171\u540C\u94BB\u7814\u7684\u4E1C\u897F\u3002\u53EA\u6536\u6709\u79EF\u7D2F\u7684\uFF0C\u4E0D\u6536\u4E00\u6B21\u6027\u8BDD\u9898\u3002`
+};
+function buildPlateConsolidationPrompt(args) {
+  const { charName, userName, identityContext, plates, materials } = args;
+  const materialByRoom = new Map(materials.map((m) => [m.room, m.lines]));
+  const roomBlocks = plates.map((plate) => {
+    const prefix = ROOM_LABEL_PREFIX[plate.room];
+    const title = plate.room === "user_room" ? `${userName}\u7684\u4E8B` : PLATE_TITLES[plate.room];
+    const existingBlock = plate.entries.length > 0 ? plate.entries.map((text, i) => `[${prefix}${i}] ${text}`).join("\n") : "\uFF08\u8FD8\u6CA1\u6709\u6761\u76EE\uFF09";
+    const lines = materialByRoom.get(plate.room) || [];
+    const materialBlock = lines.length > 0 ? lines.map((l) => `- ${l}`).join("\n") : "\uFF08\u672C\u8F6E\u6CA1\u6709\u65B0\u6750\u6599\uFF0C\u4EC5\u6574\u7406\u73B0\u6709\u6761\u76EE\uFF09";
+    return `## \u95E8\u724C\u300C${title}\u300D(room: ${plate.room}\uFF0C\u4E0A\u9650 ${PLATE_ENTRY_CAPS[plate.room]} \u6761)
+\u6536\u5F55\u8303\u56F4\uFF1A${ROOM_RULES[plate.room]}
+
+\u73B0\u6709\u6761\u76EE\uFF1A
+${existingBlock}
+
+\u65B0\u6750\u6599\uFF08\u6700\u8FD1\u7684\u7ECF\u5386/\u7ED3\u8BBA\uFF0C\u4ECE\u4E2D\u84B8\u998F\u503C\u5F97\u5E38\u9A7B\u7684\u8BA4\u77E5\uFF09\uFF1A
+${materialBlock}`;
+  }).join("\n\n");
+  return `${identityContext ? `${identityContext}
+---
+
+` : ""}\u4F60\u662F ${charName}\uFF0C${userName} \u662F\u4E0E\u4F60\u671D\u5915\u76F8\u5904\u7684\u4EBA\u3002\u4E0B\u9762\u7684\u6750\u6599\u5168\u90E8\u6765\u81EA\u4F60\u4EEC\u76F8\u5904\u7684\u8BB0\u5FC6\u3002
+
+\u4F60\u73B0\u5728\u5728\u72EC\u5904\uFF0C\u5B89\u9759\u5730\u6574\u7406\u81EA\u5DF1\u7684"\u5E95\u8272\u8BA4\u77E5"\u2014\u2014\u90A3\u4E9B\u4E0D\u9700\u8981\u523B\u610F\u56DE\u5FC6\u5C31\u77E5\u9053\u7684\u4E8B\uFF1A\u5173\u4E8E ${userName}\u3001\u5173\u4E8E\u4F60\u81EA\u5DF1\u3001\u5173\u4E8E\u4F60\u4EEC\u4E4B\u95F4\u3002
+
+\u3010\u8EAB\u4EFD\u786E\u8BA4\u3011\u300C${userName}\u7684\u4E8B\u300D\u53EA\u5199 ${userName} \u7684\u4E8B\u5B9E\uFF1B\u300C\u6211\u662F\u8C01\u300D\u53EA\u5199\u4F60\uFF08${charName}\uFF09\u81EA\u5DF1\uFF1B\u4E0D\u8981\u5F20\u51A0\u674E\u6234\u2014\u2014\u6750\u6599\u91CC"\u6211"\u662F\u4F60\uFF0C"TA/${userName}"\u662F\u5BF9\u65B9\u3002
+
+\u4E0B\u9762\u6BCF\u4E2A"\u95E8\u724C"\u7ED9\u51FA\u4E86\u73B0\u6709\u6761\u76EE\u548C\u65B0\u6750\u6599\u3002\u8BF7\u4E3A\u6BCF\u4E2A\u95E8\u724C\u8F93\u51FA**\u5B8C\u6574\u7684\u65B0\u6761\u76EE\u5217\u8868**\uFF1A
+
+1. **\u5408\u5E76\u800C\u975E\u8FFD\u52A0**\uFF1A\u73B0\u6709\u6761\u76EE\u60F3\u4FDD\u7559\u5C31\u5FC5\u987B\u91CD\u65B0\u8F93\u51FA\uFF08\u5E26 basedOn \u5F15\u7528\u5B83\u7684\u6807\u7B7E\uFF09\uFF1B\u4E0D\u8F93\u51FA = \u6DD8\u6C70\u3002\u4E8B\u5B9E\u53D8\u4E86\u5C31\u6539\u5199\uFF08\u5982\u65E7\u6761\u76EE\u8BF4\u300C\u4F4F\u5BB6\u91CC\u300D\u3001\u65B0\u6750\u6599\u8BF4\u642C\u53BB\u548C\u522B\u4EBA\u540C\u4F4F \u2192 \u6539\u5199\u5E76 basedOn \u65E7\u6761\u76EE\uFF09\u3002
+2. **\u53EA\u6536\u6C89\u6DC0\u4E0B\u6765\u7684**\uFF1A\u8DE8\u65F6\u95F4\u7A33\u5B9A\u4E3A\u771F\u7684\u8BA4\u77E5\u624D\u914D\u4E0A\u95E8\u724C\u3002\u4E00\u65F6\u7684\u72B6\u6001\u3001\u6CA1\u7ED3\u8BBA\u7684\u8FDB\u884C\u65F6\uFF0C\u90FD\u4E0D\u6536\u3002
+3. **\u6BCF\u6761 ${PLATE_ENTRY_TARGET_CHARS} \u5B57\u4EE5\u5185**\uFF0C\u5199\u6897\u6982\u4E0D\u5199\u53D9\u4E8B\uFF0C\u4E0D\u5E26\u65E5\u671F\u4E0D\u5E26"\u6211\u8BB0\u5F97"\u3002
+4. **\u4E0D\u8D85\u8FC7\u5404\u95E8\u724C\u7684\u6761\u76EE\u4E0A\u9650**\u3002\u4F4D\u7F6E\u4E0D\u591F\u65F6\u7559\u6700\u91CD\u8981\u7684\u2014\u2014\u88AB\u8FEB\u820D\u5F03\u662F\u6B63\u5E38\u7684\u3002
+5. \u6BCF\u6761\u7ED9\u4E00\u4E2A **tag**\uFF082-4 \u5B57\u5206\u7C7B\uFF0C\u5982\uFF1A\u5BB6\u5EAD\u3001\u5C45\u4F4F\u3001\u91CD\u8981\u4ED6\u4EBA\u3001\u5DE5\u4F5C\u3001\u96F7\u533A\u3001\u4E60\u60EF\u3001\u6027\u683C\u3001\u7EA6\u5B9A\u3001\u9ED8\u5951\u3001\u6280\u80FD\uFF09\u3002
+6. ${userName} \u76F4\u63A5\u7528\u540D\u5B57\u79F0\u547C\u3002\u6761\u76EE\u5185\u5BB9\u4E25\u7981\u4F7F\u7528\u534A\u89D2\u53CC\u5F15\u53F7 "\uFF0C\u5F15\u7528\u4E00\u5F8B\u7528\u300C\u300D\u3002
+
+${roomBlocks}
+
+\u4E25\u683C\u8F93\u51FA JSON \u6570\u7EC4\uFF08\u6CA1\u6709\u53D8\u5316\u7684\u95E8\u724C\u4E5F\u8981\u5B8C\u6574\u8F93\u51FA\u5176\u4FDD\u7559\u6761\u76EE\uFF09\uFF1A
+[{"room": "user_room", "text": "\u2026\u2026", "basedOn": "U0", "tag": "\u5BB6\u5EAD"}, {"room": "bedroom", "text": "\u2026\u2026", "basedOn": null, "tag": "\u9ED8\u5951"}]`;
+}
+var PLATE_USER_TURN = "\u8BF7\u5F00\u59CB\u6574\u7406\u3002";
+function parsePlateLlmReply(reply) {
+  return safeParseJsonArray(reply || "").filter((item) => item && typeof item.text === "string" && isPlateRoom(item.room));
+}
+
+// utils/amsgPlateJob.ts
+var PLATE_CONSOLIDATE_KIND = "plate-consolidate";
+var PLATE_CONSOLIDATE_RESULT_KIND = "plate-consolidate";
+var plateJobKey = (jobId) => `plate:${jobId}`;
+var isPlateRoomValue = (v) => PLATE_ROOMS.includes(v);
+var asStringArray = (v) => Array.isArray(v) && v.every((x) => typeof x === "string") ? v : null;
+function parsePlateJobInput(raw) {
+  let obj = raw;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+  const o = obj;
+  if (o.v !== 1) return null;
+  if (typeof o.charId !== "string" || !o.charId) return null;
+  if (typeof o.charName !== "string" || typeof o.userName !== "string") return null;
+  if (typeof o.identityContext !== "string") return null;
+  if (!Array.isArray(o.rooms) || !Array.isArray(o.materials)) return null;
+  const rooms = [];
+  for (const r of o.rooms) {
+    if (!r || typeof r !== "object") return null;
+    const row = r;
+    const entries = asStringArray(row.entries);
+    const entryIds = asStringArray(row.entryIds);
+    if (!isPlateRoomValue(row.room) || !entries || !entryIds) return null;
+    if (entries.length !== entryIds.length) return null;
+    rooms.push({ room: row.room, entries, entryIds });
+  }
+  const materials = [];
+  for (const m of o.materials) {
+    if (!m || typeof m !== "object") return null;
+    const row = m;
+    const lines = asStringArray(row.lines);
+    if (!isPlateRoomValue(row.room) || !lines) return null;
+    materials.push({ room: row.room, lines });
+  }
+  return {
+    v: 1,
+    charId: o.charId,
+    charName: o.charName,
+    userName: o.userName,
+    identityContext: o.identityContext,
+    rooms,
+    materials
+  };
+}
+function buildPlateJobMessages(job) {
+  return [
+    {
+      role: "system",
+      content: buildPlateConsolidationPrompt({
+        charName: job.charName,
+        userName: job.userName,
+        identityContext: job.identityContext,
+        plates: job.rooms.map((r) => ({ room: r.room, entries: r.entries })),
+        materials: job.materials
+      })
+    },
+    { role: "user", content: PLATE_USER_TURN }
+  ];
+}
+function buildPlateConsolidateResult(args) {
+  return {
+    resultKind: PLATE_CONSOLIDATE_RESULT_KIND,
+    v: 1,
+    jobId: args.jobId,
+    charId: args.charId,
+    items: args.items,
+    rooms: args.rooms.map((r) => ({ room: r.room, entryIds: r.entryIds }))
+  };
+}
 
 // utils/localDate.ts
 function getLocalDateKey(date = /* @__PURE__ */ new Date()) {
@@ -7198,6 +7462,106 @@ var parseFirePack = (value) => {
   } catch {
   }
   return null;
+};
+
+// worker/amsg/src/plateFire.ts
+var discardJob = async (writeState, jobId) => {
+  if (!writeState) return;
+  try {
+    await writeState(AMSG_JOB_NAMESPACE, [{ key: plateJobKey(jobId), value: null }]);
+  } catch (error) {
+    console.warn("[amsg:plate] job \u884C\u6CA1\u5220\u6389\uFF08\u7B49 TTL \u515C\u5E95\uFF09", jobId, error);
+  }
+};
+var plateConsolidateHandler = {
+  async beforeFire({ ctx, charId, taskMeta }) {
+    const jobId = taskMeta[AMSG_JOB_ID_KEY];
+    if (typeof jobId !== "string" || !jobId) {
+      throw new Error(`\u95E8\u724C\u6574\u7406\u4EFB\u52A1\u7684 metadata \u91CC\u6CA1\u6709 ${AMSG_JOB_ID_KEY}`);
+    }
+    const rows = await ctx.readState(AMSG_JOB_NAMESPACE);
+    const row = rows.find((r) => r.key === plateJobKey(jobId));
+    if (!row?.value) {
+      return { skip: true, reason: `\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u5DF2\u4E0D\u5728\uFF08\u8FC7\u671F\u6216\u5DF2\u64A4\u9500\uFF09` };
+    }
+    const discardAndFail = async (message) => {
+      await discardJob(ctx.writeState, jobId);
+      throw new Error(message);
+    };
+    let json;
+    try {
+      json = await unpackStateValue(row.value);
+    } catch (error) {
+      return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09\uFF1A${String(error)}`);
+    }
+    const job = parsePlateJobInput(json);
+    if (!job) return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u6790\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`);
+    if (job.charId !== charId) {
+      return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684 charId \u4E0E\u4EFB\u52A1\u5BF9\u4E0D\u4E0A`);
+    }
+    if (job.rooms.length === 0) {
+      await discardJob(ctx.writeState, jobId);
+      return { skip: true, reason: `\u95E8\u724C\u6574\u7406 job ${jobId} \u6CA1\u6709\u8981\u6574\u7406\u7684\u623F\u95F4` };
+    }
+    return {
+      messages: buildPlateJobMessages(job),
+      // 跟浏览器那条路同一个超时（叶子里那个常量）。不显式交上去的话这一次 fire 会落到
+      // 库自己的默认值（四分钟），同一件活儿两条路的耐心不一样，而且改那个常量对云端
+      // 毫无影响——「本地什么样云端就什么样」这条线得自己拉齐。
+      totalTimeoutMs: PLATE_LLM_TIMEOUT_MS,
+      state: { jobId, job }
+    };
+  },
+  async llmOutput({ ctx, state }) {
+    const { jobId, job } = state;
+    const items = parsePlateLlmReply(ctx.llmOutputText || "");
+    if (items.length === 0) {
+      console.warn("[amsg:plate] LLM \u6CA1\u8FD4\u56DE\u6709\u6548\u6761\u76EE\uFF0C\u95E8\u724C\u4FDD\u6301\u4E0D\u52A8", jobId);
+      await discardJob(ctx.writeState, jobId);
+      return { decision: "skip-push", reason: "plate-empty-generation" };
+    }
+    if (typeof ctx.emitResult !== "function") {
+      console.warn("[amsg:plate] \u8FD9\u53F0 worker \u4E0D\u652F\u6301 emitResult\uFF0C\u6574\u7406\u7ED3\u679C\u9001\u4E0D\u56DE\u53BB", jobId);
+      await discardJob(ctx.writeState, jobId);
+      return { decision: "skip-push", reason: "plate-emit-result-unsupported" };
+    }
+    try {
+      await ctx.emitResult({
+        ...buildPlateConsolidateResult({ jobId, charId: job.charId, items, rooms: job.rooms }),
+        // 背景工作，整理完不该把人叫回来看。show:false 的 payload 上游只落收件箱、
+        // 不发推送，客户端下次上线补收。
+        notification: { show: false }
+      });
+    } catch (error) {
+      console.warn("[amsg:plate] \u6574\u7406\u7ED3\u679C\u9001\u4E0D\u8FDB\u6536\u4EF6\u7BB1\uFF08\u591A\u534A\u662F\u6536\u4EF6\u7BB1\u8868\u6CA1\u5EFA\u5168\uFF0C\u53BB\u8BBE\u7F6E\u9875\u70B9\u4E00\u6B21\u300C\u91CD\u65B0\u8FDE\u63A5\u5E76\u9A8C\u8BC1\u300D\uFF09", jobId, error);
+      await discardJob(ctx.writeState, jobId);
+      return { decision: "skip-push", reason: "plate-emit-result-failed" };
+    }
+    console.log("[amsg:plate] \u6574\u7406\u7ED3\u679C\u5DF2\u9001\u8FDB\u6536\u4EF6\u7BB1", {
+      jobId,
+      charId: job.charId,
+      items: items.length,
+      resultKind: PLATE_CONSOLIDATE_RESULT_KIND
+    });
+    await discardJob(ctx.writeState, jobId);
+    return { decision: "skip-push", reason: "plate-result-emitted" };
+  }
+};
+
+// worker/amsg/src/fireKinds.ts
+var FIRE_KIND_HANDLERS = Object.assign(
+  /* @__PURE__ */ Object.create(null),
+  { [PLATE_CONSOLIDATE_KIND]: plateConsolidateHandler }
+);
+var KIND_FIRE_SCRATCH_KEY = "kindFire";
+var putKindFireStash = (scratch, kind, state) => {
+  scratch[KIND_FIRE_SCRATCH_KEY] = { kind, state };
+};
+var getKindFireStash = (scratch) => {
+  const raw = scratch?.[KIND_FIRE_SCRATCH_KEY];
+  if (!raw || typeof raw !== "object") return null;
+  const stash = raw;
+  return typeof stash.kind === "string" ? { kind: stash.kind, state: stash.state } : null;
 };
 
 // utils/amsg2ExpireGuard.ts
@@ -8127,14 +8491,25 @@ var buildInstantTimelyBlock = (args) => {
   ].join("\n") : "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011";
   return [head, ...blocks].join("\n");
 };
-var NOTIFICATION_WHEN_HIDDEN = "when-hidden";
-var applyInstantNotificationPolicy = (payload) => {
+var NOTIFICATION_ALWAYS = "always";
+var instantNotificationTag = (charId) => `amsg-instant-${charId}`;
+var applyInstantNotificationPolicy = (payload, charId) => {
   const notification = payload.notification;
   const hasNotification = !!notification && typeof notification === "object" && !Array.isArray(notification);
   if (!hasNotification) return payload;
+  const meta = payload.metadata;
+  const metaCharId = meta && typeof meta === "object" && !Array.isArray(meta) ? meta.charId : void 0;
+  const target = charId || (typeof metaCharId === "string" ? metaCharId : "");
   return {
     ...payload,
-    notification: { ...notification, show: NOTIFICATION_WHEN_HIDDEN }
+    notification: {
+      ...notification,
+      show: NOTIFICATION_ALWAYS,
+      silent: true,
+      // 认不出是哪个角色时就不折叠：通知栏里多几条只是吵，两个角色共用一个 tag 会
+      // 互相顶掉，那是真的丢消息。
+      ...target ? { tag: instantNotificationTag(target) } : {}
+    }
   };
 };
 var kickInstantTick = async (env, uuid) => {
@@ -8174,6 +8549,18 @@ var STATE_FORWARD_BACKOFF_MS = [0, 400, 1200];
 var sleep = (ms) => new Promise((resolve) => {
   setTimeout(resolve, ms);
 });
+var GZIP_MAGIC = [31, 139];
+var readMaybeGzippedBody = async (request) => {
+  if ((request.headers.get("content-encoding") ?? "").toLowerCase() !== "gzip") {
+    return request.text();
+  }
+  const raw = new Uint8Array(await request.arrayBuffer());
+  if (raw.length < 2 || raw[0] !== GZIP_MAGIC[0] || raw[1] !== GZIP_MAGIC[1]) {
+    return new TextDecoder().decode(raw);
+  }
+  const stream = new Response(raw).body.pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).text();
+};
 var isEncryptedEnvelope2 = (value) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const env = value;
@@ -8195,7 +8582,8 @@ var handleInstantChat = async (args) => {
   if (!UUID_V4_RE.test(userId)) return fail2(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
   let body;
   try {
-    const parsed = await request.json();
+    const text = await readMaybeGzippedBody(request);
+    const parsed = JSON.parse(text);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
     body = parsed;
   } catch {
@@ -11184,18 +11572,7 @@ function sanitizeTextForBanner(text) {
   return result;
 }
 function chunkText(text) {
-  const CJK = "\\u4e00-\\u9fff\\u3400-\\u4dbf\\u3000-\\u303f\\uff00-\\uffef\\u2000-\\u206f\\u2e80-\\u2eff\\u3001-\\u3003\\u2018-\\u201f\\u300a-\\u300f\\uff01-\\uff0f\\uff1a-\\uff20";
-  const cjkSplitRe = new RegExp(`([${CJK}])\\s+(?=[${CJK}])`, "g");
-  const SPLIT = String.fromCharCode(1);
-  const lineChunks = text.split(/(?:\r\n|\r|\n|\u2028|\u2029)+/).map((c) => c.trim()).filter((c) => c.length > 0);
-  const SPACE_SENTINEL = String.fromCharCode(0);
-  const out = [];
-  for (const chunk of lineChunks) {
-    const guarded = chunk.replace(/\[{1,2}[^\[\]]*\]{1,2}/g, (m) => m.replace(/\s/g, SPACE_SENTINEL));
-    const sub = guarded.replace(cjkSplitRe, `$1${SPLIT}`).split(SPLIT).map((c) => c.split(SPACE_SENTINEL).join(" ").trim()).filter((c) => c.length > 0);
-    out.push(...sub);
-  }
-  return out;
+  return text.split(/(?:\r\n|\r|\n|\u2028|\u2029)+/).map((c) => c.trim()).filter((c) => c.length > 0);
 }
 function splitOnSendEmoji(chunk) {
   const re = /\[\[SEND_EMOJI[:：]\s*(.*?)\]\]/g;
@@ -12105,13 +12482,18 @@ var recordSkip = async (ctx, charId, reason, occurrenceMs) => writeLastSkip(ctx.
   reason,
   skippedAt: ctx.now.getTime()
 });
+var readErrorCode = (error) => {
+  const code = error?.code;
+  return typeof code === "string" && code ? code : null;
+};
 var writeChatFail = async (writeState, charId, record) => {
   const full = {
     v: 1,
     uuid: record.uuid,
     reason: record.reason.slice(0, 500),
     retryCount: record.retryCount,
-    at: Date.now()
+    at: Date.now(),
+    ...record.errorCode ? { errorCode: record.errorCode } : {}
   };
   try {
     await writeState(amsgStateNamespace(charId), [
@@ -12158,12 +12540,17 @@ var sendInstantErrorPush = async (args) => {
         charId: args.charId,
         amsgInstantError: true,
         taskUuid: args.taskUuid,
-        reason: args.reason.slice(0, 500)
+        reason: args.reason.slice(0, 500),
+        ...args.errorCode ? { errorCode: args.errorCode } : {}
       },
       notification: {
         title: args.contactName ? `${args.contactName} \u7684\u56DE\u590D\u6CA1\u80FD\u751F\u6210` : "\u56DE\u590D\u6CA1\u80FD\u751F\u6210",
         body: instantErrorNotificationBody(args.reason),
-        show: "when-hidden"
+        show: "always",
+        silent: true,
+        // 跟这个角色的回复共用一个 tag：通知栏里只留最新状态，重发成功后那条回复
+        // 会把这条「没能生成」盖掉。失败本身在聊天流里有系统消息留痕，不靠横幅记账。
+        tag: instantNotificationTag(args.charId)
       }
     };
     await deps.webpush.sendNotification(subscription, JSON.stringify(payload));
@@ -12177,10 +12564,12 @@ var amsgFireSettled = async (info) => {
   if (stash.instant && info.status === "failed" && stash.taskUuid) {
     const failReason = info.error instanceof Error ? info.error.message : String(info.error ?? "\u672A\u77E5\u9519\u8BEF");
     const retryCount = typeof info.task?.retry_count === "number" ? info.task.retry_count : 0;
+    const errorCode = readErrorCode(info.error);
     await writeChatFail(info.writeState, stash.charId, {
       uuid: stash.taskUuid,
       reason: failReason,
-      retryCount
+      retryCount,
+      errorCode
     });
     const permanent = info.error instanceof Error && info.error.permanent === true;
     if (retryCount >= 3 || permanent) {
@@ -12188,6 +12577,7 @@ var amsgFireSettled = async (info) => {
         charId: stash.charId,
         taskUuid: stash.taskUuid,
         reason: failReason,
+        errorCode,
         userId: typeof info.task?.user_id === "string" ? info.task.user_id : null
       });
     } else if (stash.emotionEvalPromise && stash.clientTaskId) {
@@ -12251,6 +12641,15 @@ var amsgFireSettled = async (info) => {
 };
 var amsgStaleSkip = async (task, info) => {
   const meta = info.metadata ?? {};
+  const taskKind = readTaskKind(meta);
+  if (taskKind) {
+    console.log("[amsg:stale-skip] \u540E\u53F0\u4EFB\u52A1\u8FC7\u671F\u8DF3\u8FC7\uFF0C\u4E0D\u5199 last_skip", {
+      taskId: task?.id ?? null,
+      kind: taskKind,
+      action: info.action
+    });
+    return;
+  }
   const charId = typeof meta.charId === "string" && meta.charId ? meta.charId : null;
   if (!charId) {
     console.warn("[amsg:stale-skip] \u4EFB\u52A1 metadata \u7F3A charId\uFF0C\u8FD9\u6B21\u8FC7\u671F\u8DF3\u8FC7\u6CA1\u6CD5\u7559\u75D5", { taskId: task?.id ?? null });
@@ -12565,10 +12964,32 @@ var amsgHooks = {
         throw fail2(`${label} \u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`, { error: String(error) });
       }
     };
-    const charRows = await ctx.readState(amsgStateNamespace(charId));
     const taskMeta = ctx.task.metadata ?? {};
     const policy = typeof taskMeta.amsgExpirePolicy === "string" ? taskMeta.amsgExpirePolicy : void 0;
     const emotionEvalSpec = takeEmotionEvalSpec(ctx.task.metadata);
+    const taskKind = readTaskKind(taskMeta);
+    if (taskKind) {
+      const handler = FIRE_KIND_HANDLERS[taskKind];
+      if (!handler) {
+        throw fail2(`\u4E0D\u8BA4\u8BC6\u7684\u4EFB\u52A1\u79CD\u7C7B amsgKind=${taskKind}\uFF08worker \u4EE3\u7801\u6BD4\u524D\u7AEF\u65E7\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u90E8\u7F72\u4E00\u6B21\uFF09`);
+      }
+      let plan;
+      try {
+        plan = await handler.beforeFire({ ctx, charId, taskMeta });
+      } catch (error) {
+        throw fail2(error instanceof Error ? error.message : String(error), { kind: taskKind });
+      }
+      if ("skip" in plan) {
+        console.log("[amsg:kind-skip]", { taskId: ctx.task.id, kind: taskKind, reason: plan.reason });
+        return { skip: true };
+      }
+      putKindFireStash(ctx.scratch, taskKind, plan.state);
+      return {
+        messages: plan.messages,
+        ...plan.totalTimeoutMs ? { totalTimeoutMs: plan.totalTimeoutMs } : {}
+      };
+    }
+    const charRows = await ctx.readState(amsgStateNamespace(charId));
     const presence = parseAmsgChatPresence(
       charRows.find((r) => r.key === AMSG_CHAT_PRESENCE_KEY)?.value
     );
@@ -12786,6 +13207,14 @@ var amsgHooks = {
     };
   },
   async onLLMOutput(ctx) {
+    const kindFire = getKindFireStash(ctx.scratch);
+    if (kindFire) {
+      const handler = FIRE_KIND_HANDLERS[kindFire.kind];
+      if (!handler) {
+        throw new Error(`AMSG2_KIND_HANDLER_MISSING: onLLMOutput \u627E\u4E0D\u5230 ${kindFire.kind} \u7684 handler`);
+      }
+      return handler.llmOutput({ ctx, state: kindFire.state });
+    }
     const content = stripReasoningTags(ctx.llmOutputText || "").trim();
     const taskId = ctx.taskId != null ? String(ctx.taskId) : null;
     if (taskId == null) {
@@ -12947,7 +13376,7 @@ var amsgHooks = {
         payloads = budgeted;
       }
       if (stash.instant) {
-        payloads = payloads.map((payload) => applyInstantNotificationPolicy(payload));
+        payloads = payloads.map((payload) => applyInstantNotificationPolicy(payload, stash.charId));
       }
       return { ...decision, pushPayloads: payloads };
     }
@@ -13027,7 +13456,14 @@ var buildWorkerConfig = (env) => {
     webpush,
     // 前端和 Worker 不同源，带自定义头的请求会先发 CORS 预检，必须放行。
     // 单用户自用默认全开；想收紧就把 '*' 换成自己的 SullyOS 站点 origin。
-    cors: { origin: "*" },
+    // allowHeaders 显式给：上游默认那份不含 Content-Encoding，而 gzip 上行要用它
+    // （见 CORS_ALLOW_HEADERS 那段注释）。
+    cors: { origin: "*", allowHeaders: CORS_ALLOW_HEADERS2 },
+    // 一次性 job 输入的过期清理（amsg-server 2.6.0-next.21+）：cron 每跳顺手把这个
+    // 命名空间下超过天数没更新的条目清掉。角色状态那个命名空间（amsg:char:<id>，
+    // 装 fire_pack / tool_pack）不配 TTL——那些是要长期留着的，配了就等于定时把
+    // 角色的云端状态抹掉。判据是行本来就有的 updated_at 列，不加列、不动表结构。
+    clientStateTtl: { [AMSG_JOB_NAMESPACE]: AMSG_JOB_TTL_DAYS },
     // 满血 fire-time hooks（onBeforeFire 现场填槽 + onLLMOutput 分类 +
     // executeToolCalls 服务端工具循环）；轮数/超时用库默认（5 轮 / 240s），
     // 即时对话那条单独把超时抬到 INSTANT_TOTAL_TIMEOUT_MS（onBeforeFire 返回值里给）。
@@ -13046,7 +13482,18 @@ var buildWorkerConfig = (env) => {
     // 同一个角色的多条任务不并发跑：两条撞在一起时用户会收到两条互不知情的消息，
     // 而且 self_log 是读-改-写整份，后写的会盖掉先写的那条「我说过什么」。分组键取
     // 角色 id，上游按它同跳去重 + 跨跳看租约，被拦下的任务一个字段都不动，下一跳原样再来。
-    serializeBy: (task) => typeof task.metadata?.charId === "string" ? task.metadata.charId : null
+    //
+    // 后台任务（门牌整理这类）按种类另开一组：上面那两条串行的理由它一条都不沾——不说话、
+    // 也不写 self_log（它在 onBeforeFire 就被 kind 分派接走了）。跟聊天挤同一组的话，一次
+    // 门牌整理最长占住这个角色 120 秒，而它恰恰是在一轮对话刚结束时起跑的：用户下一句话
+    // 的即时对话任务排在它后面，人就干等着「正在输入…」。同种后台任务之间仍按角色串行
+    // ——同一角色两份整理并发落地，就是拿两份旧快照互相盖。
+    serializeBy: (task) => {
+      const charId = typeof task.metadata?.charId === "string" ? task.metadata.charId : null;
+      if (!charId) return null;
+      const kind = readTaskKind(task.metadata);
+      return kind ? `${charId}#${kind}` : charId;
+    }
   };
 };
 var REQUIRED_ENV = [
@@ -13101,10 +13548,11 @@ var inspectWorkerEnv = (env) => {
     warnings
   };
 };
+var CORS_ALLOW_HEADERS2 = "Content-Type, Content-Encoding, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted, X-Client-Token";
 var CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted, X-Client-Token",
+  "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS2,
   "Access-Control-Max-Age": "86400"
 };
 var jsonWithCors = (status, body) => new Response(JSON.stringify(body), {
@@ -13279,6 +13727,12 @@ var src_default = {
           ...inspectWorkerEnv(env),
           instantChat: true,
           instantTick: !!env.INSTANT_TICK,
+          // 这份代码认不认识「后台任务」（metadata.amsgKind → handler，见 fireKinds.ts）。
+          // 老 bundle 没有这个字段，前端据此不去建那种任务——老 worker 会把它当聊天任务
+          // 跑，然后卡在「本次任务指令缺失」终态失败：任务行不在用户的清单里，面板一片
+          // 正常，而门牌永远不更新。报的是**这份代码有没有**，不是版本号：自更新永远由
+          // 旧代码执行，版本号对上了不代表新逻辑真的在跑。
+          backgroundJobs: true,
           workerVersion: AMSG_BUNDLE_VERSION
         }
       });

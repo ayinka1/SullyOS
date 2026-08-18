@@ -26,22 +26,27 @@ describe('CompanionHome touch request boundaries', () => {
   it('pre-generates touch voice only when opted in and plays persisted audio without per-tap TTS', () => {
     const source = readFileSync(path.resolve(__dirname, '../components/os/CompanionHome.tsx'), 'utf8');
     const voiceSource = readFileSync(path.resolve(__dirname, './avatarTouchVoice.ts'), 'utf8');
+    const voiceAssetSource = readFileSync(path.resolve(__dirname, './companionVoiceAssets.ts'), 'utf8');
 
     expect(source).toContain('data-testid="companion-touch-generate-voice"');
     expect(source).toContain('if (touchGenerateVoice)');
     expect(source).toContain('createAvatarTouchVoiceUrl(voice)');
     expect(source).not.toContain('synthesizeSpeechDetailed(');
     expect(voiceSource).toContain('synthesizeSpeechDetailed(');
-    expect(voiceSource).toContain('DB.putBlobAsset');
+    expect(voiceSource).toContain('saveCompanionVoiceBlob');
     expect(voiceSource).toContain('VOICE_CONCURRENCY = 2');
     expect(source).toContain('data-testid="companion-generate-startup-voice"');
     expect(source).toContain('data-testid="companion-startup-voice-language"');
     expect(source).toContain('data-testid="companion-touch-voice-language"');
     expect(source).toContain('data-testid="companion-startup-translation"');
     expect(source).toContain('generateCompanionStartupVoice');
-    expect(voiceSource).toContain('companion-startup-voice:');
+    expect(voiceAssetSource).toContain("COMPANION_STARTUP_VOICE_ASSET_PREFIX = 'companion-startup-voice:'");
     expect(voiceSource).toContain('voiceText: options.text');
     expect(voiceSource).toContain('languageBoost: options.voiceLanguage || undefined');
+    expect(source).toContain('data-testid="companion-startup-preset-select"');
+    expect(source).toContain('data-testid="companion-touch-preset-select"');
+    expect(source).toContain('保存为新预设');
+    expect(source).toContain('生成并保存新预设');
   });
 
   it('sequences a local touch impulse and uses the center star for real apps', () => {
@@ -118,7 +123,20 @@ describe('CompanionHome touch request boundaries', () => {
     expect(source).not.toContain('data-testid="companion-layout-picker"');
     expect(source).not.toContain('data-testid="companion-layout-editor"');
     expect(source).toContain('data-testid="companion-character-crop-editor"');
-    expect(source).toContain('showCropGuide={editing && editingPanel === \'character\'}');
+    expect(source).toContain('showCropGuide={editing && editingPanel === \'character\' && compositionFramingMode === \'base\'}');
+    expect(source).toContain('data-testid="companion-face-anchor-mode"');
+    expect(source).toContain('faceFraming: faceAnchorDraftEnabled ? faceFramingDraft : undefined');
+    expect(source).toContain('data-testid="companion-touch-region-mode"');
+    expect(source).toContain('data-testid="companion-touch-region-editor-panel"');
+    expect(source).toContain('touchRegions: touchRegionsDraft.length ? touchRegionsDraft : undefined');
+    expect(source).toContain("compositionFramingMode === 'touch'");
+    expect(source).toContain('onTouchRegionsChange={editing ? setTouchRegionsDraft : undefined}');
+    expect(source).toContain('data-testid="companion-collapse-composition"');
+    expect(source).toContain('data-testid="companion-expand-composition"');
+    expect(source).toContain("data-collapsed={compositionEditorCollapsed ? 'true' : 'false'}");
+    expect(source).toContain('data-testid="companion-live2d-texture-quality-picker"');
+    expect(source).toContain("textureQuality: quality");
+    expect(source).toContain("isBuiltinSullyLive2D(character.videoAvatar) && (hit.zone === 'head' || hit.zone === 'face')");
     expect(source).toContain('data-testid="companion-appearance-rail-button"');
     expect(source).toContain('data-testid="companion-real-wardrobe-button"');
     expect(source).toContain('<CompanionWardrobeDrawer');
@@ -284,6 +302,7 @@ describe('CompanionHome touch request boundaries', () => {
   });
 
   it('makes imported Live2D outfits an explicit manual-only wardrobe workflow', () => {
+    const source = readFileSync(path.resolve(__dirname, '../components/os/CompanionHome.tsx'), 'utf8');
     const typeSource = readFileSync(path.resolve(__dirname, '../types.ts'), 'utf8');
     const callSource = readFileSync(path.resolve(__dirname, '../apps/CallApp.tsx'), 'utf8');
     const settingsSource = readFileSync(path.resolve(__dirname, '../components/call/Live2DActionSettings.tsx'), 'utf8');
@@ -305,6 +324,10 @@ describe('CompanionHome touch request boundaries', () => {
     expect(stageSource).toContain('!action.wardrobe');
     expect(wardrobeSource).toContain('data-testid="companion-real-wardrobe"');
     expect(wardrobeSource).toContain('onOpenComposition');
+    expect(wardrobeSource).toContain('data-testid="companion-wardrobe-delete-confirm"');
+    expect(wardrobeSource).toContain('onLongPress');
+    expect(source).toContain('storeCompanionModelOutfit(character, model)');
+    expect(source).not.toContain('|| avatar.actions.find(item => item.wardrobe)');
   });
 
   it('teaches the wardrobe scene entry once and keeps it available for static portraits', () => {
@@ -420,6 +443,8 @@ describe('CompanionHome touch request boundaries', () => {
     expect(live2dSource).toContain("core.setParameterValueById(resolveId('ParamEyeBallX'), finalEyeX)");
     expect(live2dSource).toContain("host.dataset.live2dFinalEyes = `${finalEyeX.toFixed(3)},${finalEyeY.toFixed(3)}`");
     expect(live2dSource).toContain("const finalMouth = motionStateRef.current === 'speaking' ? lastMouthLevel : 0");
+    expect(live2dSource).toContain('for (const id of mouthOpenParameterIds)');
+    expect(live2dSource).not.toContain("for (const id of config.lipSyncParameterIds.length ? config.lipSyncParameterIds : ['ParamMouthOpenY'])");
     expect(live2dSource).toContain("core.setParameterValueById(resolveId(id), finalMouth)");
     expect(live2dSource).toContain("host.dataset.live2dFinalMouth = finalMouth.toFixed(3)");
     expect(live2dSource).toContain('if (!locked || directedHead.motionOwnsHead || directedHead.paramsOwnHead) return;');

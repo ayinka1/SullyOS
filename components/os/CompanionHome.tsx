@@ -3,6 +3,8 @@ import {
   ArrowClockwise,
   ArrowsOutCardinal,
   CaretDown,
+  CaretLeft,
+  CaretRight,
   Check,
   Crop,
   Gear,
@@ -16,7 +18,7 @@ import {
   UploadSimple,
 } from '@phosphor-icons/react';
 import { useOS } from '../../context/OSContext';
-import { AppID, type CompanionStartupSettings, type CompanionTouchReaction, type DailySchedule } from '../../types';
+import { AppID, type AvatarTouchRegion, type CompanionStartupSettings, type CompanionTouchReaction, type CompanionTouchSettings, type DailySchedule } from '../../types';
 import { Icons, INSTALLED_APPS } from '../../constants';
 import VRMVideoCallStage from '../call/VRMVideoCallStage';
 import { ScheduleFullscreenViewer } from '../schedule/ScheduleHomeWidget';
@@ -50,15 +52,13 @@ import {
   type AvatarStageCrop,
   type AvatarStageFraming,
 } from '../../utils/avatarPerformance';
-import { deleteBlobRef, isBlobRef, putImageBlob, useBlobRefUrl } from '../../utils/blobRef';
+import { deleteBlobRef, deleteBlobRefIfUnreferenced, isBlobRef, putImageBlob, useBlobRefUrl } from '../../utils/blobRef';
 import { hslToHex, hueFromGradient, hueFromImage, normalizeHue } from '../../utils/dominantHue';
 import { characterHasVoice } from '../../utils/ttsRouter';
 import { CallAudioFeed } from '../../utils/callAudioFeed';
 import { VOICE_LANGUAGE_OPTIONS, voiceLanguageLabel } from '../../utils/voiceLanguage';
 import {
-  cleanupAvatarTouchVoiceAssets,
   generateCompanionStartupVoice,
-  collectAvatarTouchVoiceAssetIds,
   createAvatarTouchVoiceUrl,
   generateAvatarTouchVoicePack,
 } from '../../utils/avatarTouchVoice';
@@ -85,7 +85,26 @@ import IdolCompanionChrome from './IdolCompanionChrome';
 import CompanionWardrobeDrawer from './CompanionWardrobeDrawer';
 import CompanionStageLoadingCurtain, { type CompanionStageCurtainPhase } from './CompanionStageLoadingCurtain';
 import StaticCompanionPortrait from './StaticCompanionPortrait';
-import { getLive2DAIActions, getLive2DWardrobeActions, type Live2DAction } from '../../utils/live2dModelStore';
+import Live2DActionSettings from '../call/Live2DActionSettings';
+import {
+  getLive2DAIActions,
+  getLive2DWardrobeActions,
+  removeLive2DWardrobeAction,
+  saveLive2DModelFromZip,
+  type Live2DAction,
+  type Live2DAvatarConfig,
+} from '../../utils/live2dModelStore';
+import { deleteAvatarModel, saveAvatarModel } from '../../utils/avatarModelStore';
+import {
+  addUploadedCompanionOutfit,
+  listCompanionModelOutfits,
+  listUploadedCompanionOutfits,
+  removeCompanionModelOutfit,
+  removeUploadedCompanionOutfit,
+  selectCompanionModelOutfit,
+  selectUploadedCompanionOutfit,
+  storeCompanionModelOutfit,
+} from '../../utils/companionWardrobe';
 import {
   DEFAULT_COMPANION_STARTUP_PERFORMANCE,
   normalizeCompanionStartupPerformance,
@@ -108,6 +127,16 @@ import {
   resolveCompanionPortrait,
 } from '../../utils/companionAvatar';
 import { trackEvent } from '../../utils/analytics';
+import {
+  activateCompanionStartupPreset,
+  activateCompanionTouchPreset,
+  collectCompanionVoiceAssetIds,
+  removeCompanionStartupPreset,
+  removeCompanionTouchPreset,
+  saveCompanionStartupPreset,
+  saveCompanionTouchPreset,
+} from '../../utils/companionPresets';
+import { deleteCompanionVoiceBlob } from '../../utils/companionVoiceAssets';
 
 // ── 时段氛围：陪伴桌面按虚拟时间换天色（晨曦 / 白日 / 黄昏 / 夜晚）──
 interface DayPeriod {
@@ -408,6 +437,8 @@ const CompanionHome: React.FC = () => {
   });
   const [wardrobeDiscoveryOpened, setWardrobeDiscoveryOpened] = useState(false);
   const [wardrobeTrigger, setWardrobeTrigger] = useState<Live2DActionTrigger | null>(null);
+  const [wardrobeImportBusy, setWardrobeImportBusy] = useState(false);
+  const [wardrobeLive2DSettings, setWardrobeLive2DSettings] = useState<Live2DAvatarConfig | null>(null);
   const [touchGenerating, setTouchGenerating] = useState(false);
   const [touchGenerateVoice, setTouchGenerateVoice] = useState(false);
   const [startupEnabled, setStartupEnabled] = useState(false);
@@ -423,6 +454,10 @@ const CompanionHome: React.FC = () => {
   const [startupPerformanceCuePhase, setStartupPerformanceCuePhase] = useState<'start' | 'end'>('start');
   const [startupActionGenerating, setStartupActionGenerating] = useState(false);
   const [startupVoiceGenerating, setStartupVoiceGenerating] = useState(false);
+  const [startupPresetName, setStartupPresetName] = useState('');
+  const [touchPresetName, setTouchPresetName] = useState('');
+  const [selectedStartupPresetId, setSelectedStartupPresetId] = useState('');
+  const [selectedTouchPresetId, setSelectedTouchPresetId] = useState('');
   const [stageReady, setStageReady] = useState(() => staticCompanionActive || !character?.videoAvatar);
   const [stageCurtainPhase, setStageCurtainPhase] = useState<CompanionStageCurtainPhase>(() => (
     !staticCompanionActive && character?.videoAvatar ? 'covered' : 'hidden'
@@ -433,7 +468,13 @@ const CompanionHome: React.FC = () => {
   const [vrmExpressions, setVrmExpressions] = useState<string[]>([]);
   const [editing, setEditing] = useState(false);
   const [editingPanel, setEditingPanel] = useState<'character' | 'stage'>('character');
+  const [compositionEditorCollapsed, setCompositionEditorCollapsed] = useState(false);
+  const [compositionFramingMode, setCompositionFramingMode] = useState<'base' | 'face' | 'touch'>('base');
   const [framingDraft, setFramingDraft] = useState<AvatarStageFraming>(() => character?.videoAvatar?.companionFraming || DEFAULT_STAGE_FRAMING);
+  const [faceFramingDraft, setFaceFramingDraft] = useState<AvatarStageFraming>(() => character?.videoAvatar?.faceFraming || { scale: 1.8, offsetX: 0, offsetY: 0 });
+  const [faceAnchorDraftEnabled, setFaceAnchorDraftEnabled] = useState(() => Boolean(character?.videoAvatar?.faceFraming));
+  const [touchRegionsDraft, setTouchRegionsDraft] = useState<AvatarTouchRegion[]>(() => character?.videoAvatar?.format === 'live2d' ? character.videoAvatar.touchRegions || [] : []);
+  const [touchRegionEditingZone, setTouchRegionEditingZone] = useState<AvatarTouchZone>('face');
   const [cropDraft, setCropDraft] = useState<AvatarStageCrop>(() => character?.videoAvatar?.companionCrop || DEFAULT_STAGE_CROP);
   const [frameStyle, setFrameStyle] = useState<CompanionFrameStyleId>(loadCompanionFrameStyle);
   const editingRef = useRef(false);
@@ -703,6 +744,16 @@ const CompanionHome: React.FC = () => {
     setTouchVoiceProgress(null);
     setTouchGenerateVoice(Boolean(character?.companionTouchSettings?.voiceEnabled));
     setTouchVoiceLanguage(character?.companionTouchSettings?.voiceLanguage || '');
+    const activeStartupPreset = character?.companionTouchSettings?.startupPresets?.find(
+      preset => preset.id === character.companionTouchSettings?.activeStartupPresetId,
+    );
+    const activeTouchPreset = character?.companionTouchSettings?.touchPresets?.find(
+      preset => preset.id === character.companionTouchSettings?.activeTouchPresetId,
+    );
+    setSelectedStartupPresetId(activeStartupPreset?.id || '');
+    setStartupPresetName(activeStartupPreset?.name || '');
+    setSelectedTouchPresetId(activeTouchPreset?.id || '');
+    setTouchPresetName(activeTouchPreset?.name || '');
     const startup = character?.companionTouchSettings?.startup;
     setStartupEnabled(Boolean(startup?.enabled));
     setStartupLine(startup?.line || '');
@@ -723,7 +774,12 @@ const CompanionHome: React.FC = () => {
     setVrmExpressions([]);
     setEditing(false);
     setEditingPanel('character');
+    setCompositionFramingMode('base');
     setFramingDraft(character?.videoAvatar?.companionFraming || (isBuiltinSullyLive2D(character?.videoAvatar) ? { ...BUILTIN_SULLY_DEFAULT_FRAMING } : DEFAULT_STAGE_FRAMING));
+    setFaceFramingDraft(character?.videoAvatar?.faceFraming || { scale: 1.8, offsetX: 0, offsetY: 0 });
+    setFaceAnchorDraftEnabled(Boolean(character?.videoAvatar?.faceFraming));
+    setTouchRegionsDraft(character?.videoAvatar?.format === 'live2d' ? character.videoAvatar.touchRegions || [] : []);
+    setTouchRegionEditingZone('face');
     setCropDraft(character?.videoAvatar?.companionCrop || DEFAULT_STAGE_CROP);
     setPerformance(shouldPrepareStartup
       ? (startup?.enabled && normalizeCompanionDialogue(startup.line, character?.name || '')
@@ -828,7 +884,6 @@ const CompanionHome: React.FC = () => {
     () => character ? resolveCompanionPortrait(character, performance.emotion, performance.faces || []) : undefined,
     [character, performance.emotion, performance.faces],
   );
-  const staticExpressionKey = `${performance.emotion}:${(performance.faces || []).join(',')}`;
   const touchPackContentLabel = activeCompanionSource === 'upload'
     ? '台词'
     : activeCompanionSource === 'date' ? '台词与表情' : '台词与动作';
@@ -849,11 +904,26 @@ const CompanionHome: React.FC = () => {
     () => !staticCompanionActive && character?.videoAvatar?.format === 'live2d' ? getLive2DWardrobeActions(character.videoAvatar) : [],
     [character?.videoAvatar, staticCompanionActive],
   );
+  const modelOutfits = useMemo(
+    () => !staticCompanionActive ? listCompanionModelOutfits(character) : [],
+    [character?.videoAvatar, character?.videoAvatarWardrobe, staticCompanionActive],
+  );
   const staticOutfits = useMemo(
-    () => activeCompanionSource === 'date' ? listCompanionDateOutfits(character) : [],
+    () => activeCompanionSource === 'date'
+      ? listCompanionDateOutfits(character)
+      : activeCompanionSource === 'upload'
+        ? listUploadedCompanionOutfits(character?.companionAvatar).map(outfit => ({
+            id: outfit.imageRef,
+            name: outfit.fileName || '静态图片',
+            preview: outfit.imageRef,
+            expressionCount: 1,
+          }))
+        : [],
     [activeCompanionSource, character],
   );
-  const activeStaticOutfitId = normalizeCompanionSkinSetId(character?.companionAvatar?.skinSetId);
+  const activeStaticOutfitId = activeCompanionSource === 'upload'
+    ? character?.companionAvatar?.imageRef
+    : normalizeCompanionSkinSetId(character?.companionAvatar?.skinSetId);
 
   const selectWardrobeAction = (action: Live2DAction) => {
     if (!character || character.videoAvatar?.format !== 'live2d' || !action.wardrobe) return;
@@ -865,7 +935,15 @@ const CompanionHome: React.FC = () => {
   };
 
   const selectStaticOutfit = (outfitId: string) => {
-    if (!character || activeCompanionSource !== 'date') return;
+    if (!character) return;
+    if (activeCompanionSource === 'upload') {
+      const companionAvatar = selectUploadedCompanionOutfit(character.companionAvatar, outfitId);
+      if (!companionAvatar) return;
+      updateCharacter(character.id, { companionAvatar });
+      addToast('静态衣服已切换', 'success');
+      return;
+    }
+    if (activeCompanionSource !== 'date') return;
     updateCharacter(character.id, {
       companionAvatar: {
         version: 1,
@@ -876,6 +954,158 @@ const CompanionHome: React.FC = () => {
     });
     trackEvent('切换桌面见面立绘衣服');
     addToast('桌面衣服已切换', 'success');
+  };
+
+  const selectModelOutfit = (assetId: string) => {
+    if (!character) return;
+    const patch = selectCompanionModelOutfit(character, assetId);
+    if (!patch) return;
+    closeWardrobe();
+    setWardrobeTrigger(null);
+    updateCharacter(character.id, {
+      ...patch,
+      companionAvatar: { version: 1, ...character.companionAvatar, source: 'model' },
+    });
+    addToast(`已切换模型：${patch.videoAvatar?.fileName || '当前外观'}`, 'success');
+  };
+
+  const deleteModelOutfit = async (assetId: string) => {
+    if (!character) return;
+    const removed = listCompanionModelOutfits(character).find(model => model.assetId === assetId);
+    if (!removed || (removed.format === 'live2d' && removed.builtIn)) return;
+    const patch = removeCompanionModelOutfit(character, assetId);
+    if (!patch) return;
+    const removingActive = character.videoAvatar?.assetId === assetId;
+    const fallbackSource = patch.videoAvatar
+      ? 'model'
+      : character.companionAvatar?.imageRef
+        ? 'upload'
+        : listCompanionDateOutfits(character).length
+          ? 'date'
+          : 'model';
+    const companionAvatar = character.companionAvatar?.source === 'model'
+      ? { ...character.companionAvatar, version: 1 as const, source: fallbackSource as 'model' | 'upload' | 'date' }
+      : character.companionAvatar;
+    const nextCharacter = { ...character, ...patch, companionAvatar };
+    if (removingActive) {
+      closeWardrobe();
+      setWardrobeTrigger(null);
+    }
+    updateCharacter(character.id, { ...patch, companionAvatar });
+    // Persist the pointer removal before reclaiming the binary package.
+    await DB.saveCharacter(nextCharacter);
+    const usedElsewhere = characters.some(item => item.id !== character.id && (
+      item.videoAvatar?.assetId === assetId
+      || (item.videoAvatarWardrobe || []).some(model => model.assetId === assetId)
+    ));
+    if (!usedElsewhere) await deleteAvatarModel(removed);
+    addToast(`${removed.fileName} 已从衣橱删除${usedElsewhere ? '（共享模型文件仍保留）' : ''}`, 'success');
+  };
+
+  const deleteStaticOutfit = async (imageRef: string) => {
+    if (!character || activeCompanionSource !== 'upload') return;
+    const removed = listUploadedCompanionOutfits(character.companionAvatar).find(item => item.imageRef === imageRef);
+    const companionAvatar = removeUploadedCompanionOutfit(character.companionAvatar, imageRef);
+    if (!removed || !companionAvatar) return;
+    const nextCharacter = { ...character, companionAvatar };
+    updateCharacter(character.id, { companionAvatar });
+    await DB.saveCharacter(nextCharacter);
+    const usedElsewhere = characters.some(item => item.id !== character.id && (
+      item.avatar === imageRef
+      || item.companionAvatar?.imageRef === imageRef
+      || (item.companionAvatar?.imageWardrobe || []).some(outfit => outfit.imageRef === imageRef)
+      || Object.values(item.sprites || {}).includes(imageRef)
+      || (item.dateSkinSets || []).some(skin => Object.values(skin.sprites).includes(imageRef))
+    ));
+    if (!usedElsewhere) await deleteBlobRefIfUnreferenced(imageRef);
+    addToast(`${removed.fileName || '静态图片'} 已从衣橱删除${usedElsewhere ? '（共享图片文件仍保留）' : ''}`, 'success');
+  };
+
+  const deleteWardrobeAction = async (actionId: string) => {
+    if (!character || character.videoAvatar?.format !== 'live2d') return;
+    const action = character.videoAvatar.actions.find(item => item.id === actionId && item.wardrobe);
+    if (!action) return;
+    const videoAvatar = removeLive2DWardrobeAction(character.videoAvatar, actionId);
+    setWardrobeTrigger(videoAvatar.activeWardrobeActionId
+      ? { id: videoAvatar.activeWardrobeActionId, nonce: Date.now() + Math.random() }
+      : null);
+    updateCharacter(character.id, { videoAvatar });
+    addToast(`${action.name} 已从衣橱移除；动作库仍保留`, 'success');
+  };
+
+  const importWardrobeOutfit = () => {
+    if (!character || wardrobeImportBusy || activeCompanionSource === 'date') return;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.style.display = 'none';
+    input.accept = activeCompanionSource === 'upload'
+      ? '.png,.gif,image/png,image/gif'
+      : character.videoAvatar?.format === 'vrm'
+        ? '.vrm,model/gltf-binary'
+        : '.zip,application/zip';
+    document.body.appendChild(input);
+    const removeInput = () => { if (input.parentElement) input.remove(); };
+    window.addEventListener('focus', () => window.setTimeout(removeInput, 1200), { once: true });
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return removeInput();
+      setWardrobeImportBusy(true);
+      try {
+        if (activeCompanionSource === 'upload') {
+          const extension = file.name.split('.').pop()?.toLowerCase();
+          if (!['png', 'gif'].includes(extension || '') || !['image/png', 'image/gif'].includes(file.type)) {
+            throw new Error('图片衣橱只支持 PNG / GIF');
+          }
+          if (file.size > 20 * 1024 * 1024) throw new Error('图片超过 20 MB，请压缩后再导入');
+          const imageRef = await putImageBlob(file);
+          updateCharacter(character.id, {
+            companionAvatar: addUploadedCompanionOutfit(character.companionAvatar, {
+              id: imageRef,
+              imageRef,
+              fileName: file.name,
+              mimeType: file.type,
+              importedAt: Date.now(),
+            }),
+          });
+          addToast(`${file.name} 已加入图片衣橱`, 'success');
+          return;
+        }
+
+        const currentModel = character.videoAvatar;
+        if (!currentModel) throw new Error('请先设置一个动态模型');
+        if (currentModel.format === 'live2d') {
+          if (!/\.zip$/i.test(file.name)) throw new Error('Live2D 衣橱只能继续导入 Live2D ZIP');
+          if (file.size > 200 * 1024 * 1024) throw new Error('Live2D ZIP 超过 200 MB');
+          const model = await saveLive2DModelFromZip(file);
+          const patch = storeCompanionModelOutfit(character, model);
+          updateCharacter(character.id, {
+            ...patch,
+            companionAvatar: { version: 1, ...character.companionAvatar, source: 'model' },
+          });
+          closeWardrobe();
+          setWardrobeLive2DSettings(model);
+          addToast(`${file.name} 已加入 Live2D 衣橱，请设置它的换装按键`, 'success');
+          return;
+        }
+
+        if (!/\.vrm$/i.test(file.name)) throw new Error('VRM 衣橱只能继续导入 VRM');
+        if (file.size > 80 * 1024 * 1024) throw new Error('VRM 超过 80 MB，请降低纹理尺寸后再导入');
+        const model = await saveAvatarModel(file);
+        const patch = storeCompanionModelOutfit(character, model);
+        updateCharacter(character.id, {
+          ...patch,
+          companionAvatar: { version: 1, ...character.companionAvatar, source: 'model' },
+        });
+        closeWardrobe();
+        addToast(`${file.name} 已加入 VRM 衣橱`, 'success');
+      } catch (error: any) {
+        addToast(error?.message || '衣橱导入失败', 'error');
+      } finally {
+        setWardrobeImportBusy(false);
+        removeInput();
+      }
+    };
+    input.click();
   };
 
   const openWardrobe = () => {
@@ -909,18 +1139,40 @@ const CompanionHome: React.FC = () => {
   const cropIsDefault = (crop: AvatarStageCrop) => (
     crop.top <= 0.001 && crop.right <= 0.001 && crop.bottom <= 0.001 && crop.left <= 0.001
   );
+  const makeFaceFramingSeed = (): AvatarStageFraming => {
+    const base = companionFraming || defaultCompanionFraming;
+    const maxScale = character?.videoAvatar?.format === 'live2d' ? 6 : 4;
+    return character?.videoAvatar?.faceFraming || {
+      ...base,
+      scale: Math.min(maxScale, Math.max(1.8, base.scale * 1.8)),
+    };
+  };
   const openCompositionEditor = () => {
     closeWardrobe();
     setAppStarOpen(false);
     setLine(null);
+    setPerformance(DEFAULT_AVATAR_PERFORMANCE);
+    setMotionState('idle');
     setEditingPanel(staticCompanionActive ? 'stage' : 'character');
+    setCompositionFramingMode('base');
     setFramingDraft(companionFraming || defaultCompanionFraming);
+    setFaceFramingDraft(makeFaceFramingSeed());
+    setFaceAnchorDraftEnabled(Boolean(character?.videoAvatar?.faceFraming));
+    setTouchRegionsDraft(character?.videoAvatar?.format === 'live2d' ? character.videoAvatar.touchRegions || [] : []);
+    setTouchRegionEditingZone('face');
     setCropDraft(companionCrop || DEFAULT_STAGE_CROP);
+    setCompositionEditorCollapsed(false);
     setEditing(true);
   };
   const cancelCompositionEditor = () => {
     setFramingDraft(companionFraming || defaultCompanionFraming);
+    setFaceFramingDraft(makeFaceFramingSeed());
+    setFaceAnchorDraftEnabled(Boolean(character?.videoAvatar?.faceFraming));
+    setTouchRegionsDraft(character?.videoAvatar?.format === 'live2d' ? character.videoAvatar.touchRegions || [] : []);
+    setTouchRegionEditingZone('face');
+    setCompositionFramingMode('base');
     setCropDraft(companionCrop || DEFAULT_STAGE_CROP);
+    setCompositionEditorCollapsed(false);
     setEditing(false);
   };
   const saveCompositionEditor = () => {
@@ -930,17 +1182,44 @@ const CompanionHome: React.FC = () => {
         videoAvatar: {
           ...prev.videoAvatar,
           companionFraming: builtinSullyAvatar || !framingIsDefault(framingDraft) ? framingDraft : undefined,
+          faceFraming: faceAnchorDraftEnabled ? faceFramingDraft : undefined,
           companionCrop: cropIsDefault(cropDraft) ? undefined : clampStageCrop(cropDraft),
+          ...(prev.videoAvatar.format === 'live2d' ? { touchRegions: touchRegionsDraft.length ? touchRegionsDraft : undefined } : {}),
         },
       } : {}
     ));
+    setCompositionFramingMode('base');
+    setCompositionEditorCollapsed(false);
     setEditing(false);
-    addToast('角色构图已保存', 'success');
+    addToast(
+      touchRegionsDraft.length
+        ? `角色构图与 ${touchRegionsDraft.length} 个触摸圈已保存`
+        : faceAnchorDraftEnabled ? '角色构图与面部特写锚点已保存' : '角色构图已保存',
+      'success',
+    );
   };
   const chooseBuiltinSullyQuality = (quality: BuiltinSullyLive2DQuality) => {
     if (!character || !builtinSullyAvatar || builtinSullyAvatar.builtinQuality === quality) return;
     updateCharacter(character.id, { videoAvatar: setBuiltinSullyLive2DQuality(builtinSullyAvatar, quality) });
     addToast(quality === 'hd' ? 'Sully 已切到高清 4K；低端设备建议使用 2K' : 'Sully 已切回轻量 2K', quality === 'hd' ? 'info' : 'success');
+  };
+  const chooseImportedLive2DTextureQuality = (quality: 'balanced' | 'hd') => {
+    if (!character?.videoAvatar || character.videoAvatar.format !== 'live2d' || character.videoAvatar.builtIn) return;
+    const current = character.videoAvatar.textureQuality === 'hd' ? 'hd' : 'balanced';
+    if (current === quality) return;
+    updateCharacter(character.id, prev => (
+      prev.videoAvatar?.format === 'live2d' && !prev.videoAvatar.builtIn
+        ? { videoAvatar: { ...prev.videoAvatar, textureQuality: quality } }
+        : {}
+    ));
+    setStageReady(false);
+    setStageCurtainPhase('covered');
+    addToast(
+      quality === 'hd'
+        ? '模型已切到高清 4K；首次切换会建立独立运行缓存'
+        : '模型已切回默认轻量 2K；更省内存、更不易闪退',
+      quality === 'hd' ? 'info' : 'success',
+    );
   };
 
   const chooseCompanionFrameStyle = (nextStyle: CompanionFrameStyleId) => {
@@ -996,6 +1275,16 @@ const CompanionHome: React.FC = () => {
     );
     setTouchGenerateVoice(Boolean(character?.companionTouchSettings?.voiceEnabled));
     setTouchVoiceLanguage(character?.companionTouchSettings?.voiceLanguage || '');
+    const activeStartupPreset = character?.companionTouchSettings?.startupPresets?.find(
+      preset => preset.id === character.companionTouchSettings?.activeStartupPresetId,
+    );
+    const activeTouchPreset = character?.companionTouchSettings?.touchPresets?.find(
+      preset => preset.id === character.companionTouchSettings?.activeTouchPresetId,
+    );
+    setSelectedStartupPresetId(activeStartupPreset?.id || '');
+    setStartupPresetName(activeStartupPreset?.name || '');
+    setSelectedTouchPresetId(activeTouchPreset?.id || '');
+    setTouchPresetName(activeTouchPreset?.name || '');
     const startup = character?.companionTouchSettings?.startup;
     setStartupEnabled(Boolean(startup?.enabled));
     setStartupLine(startup?.line || '');
@@ -1010,6 +1299,7 @@ const CompanionHome: React.FC = () => {
   };
 
   const toggleTouchZone = (zone: AvatarTouchZone) => {
+    setSelectedTouchPresetId('');
     setTouchDraftZones(current => (
       current.includes(zone)
         ? current.filter(item => item !== zone)
@@ -1017,7 +1307,107 @@ const CompanionHome: React.FC = () => {
     ));
   };
 
+  const companionTouchSettingsBase = (): CompanionTouchSettings => ({
+    enabledZones: character?.companionTouchSettings?.enabledZones || DEFAULT_COMPANION_TOUCH_ZONES,
+    reactions: character?.companionTouchSettings?.reactions || {},
+    ...character?.companionTouchSettings,
+  });
+
+  const cleanupUnreferencedCompanionVoices = (
+    before: CompanionTouchSettings | undefined,
+    after: CompanionTouchSettings | undefined,
+  ) => {
+    const keep = collectCompanionVoiceAssetIds(after);
+    collectCompanionVoiceAssetIds(before).forEach(assetId => {
+      if (!keep.has(assetId)) {
+        void deleteCompanionVoiceBlob(assetId).catch(error => {
+          console.warn('[companion] unused preset voice cleanup skipped:', error);
+        });
+      }
+    });
+  };
+
+  const loadStartupDraft = (startup?: CompanionStartupSettings) => {
+    setStartupEnabled(Boolean(startup?.enabled));
+    setStartupLine(startup?.line || '');
+    setStartupTranslation(startup?.translation || '');
+    setStartupVoiceLanguage(startup?.voiceLanguage || '');
+    setStartupPerformance(normalizeCompanionStartupPerformance(startup?.performance));
+    setStartupPerformanceCues((startup?.performanceCues || []) as AvatarPerformanceCue[]);
+    setStartupPerformanceCueText(startup?.performanceCueText || '');
+    setStartupPerformanceCueIndex(0);
+    setStartupPerformanceCuePhase('start');
+  };
+
+  const selectStartupPreset = (presetId: string) => {
+    if (!character || settingsGenerating) return;
+    if (!presetId) {
+      setSelectedStartupPresetId('');
+      setStartupPresetName('');
+      return;
+    }
+    const preset = character.companionTouchSettings?.startupPresets?.find(item => item.id === presetId);
+    if (!preset) return;
+    const before = companionTouchSettingsBase();
+    const settings = activateCompanionStartupPreset(before, presetId);
+    updateCharacter(character.id, { companionTouchSettings: settings });
+    cleanupUnreferencedCompanionVoices(before, settings);
+    loadStartupDraft(preset.startup);
+    setSelectedStartupPresetId(preset.id);
+    setStartupPresetName(preset.name);
+    addToast(`已切换开机预设「${preset.name}」`, 'success');
+  };
+
+  const selectTouchPreset = (presetId: string) => {
+    if (!character || settingsGenerating) return;
+    if (!presetId) {
+      setSelectedTouchPresetId('');
+      setTouchPresetName('');
+      return;
+    }
+    const preset = character.companionTouchSettings?.touchPresets?.find(item => item.id === presetId);
+    if (!preset) return;
+    const before = companionTouchSettingsBase();
+    const settings = activateCompanionTouchPreset(before, presetId);
+    updateCharacter(character.id, { companionTouchSettings: settings });
+    cleanupUnreferencedCompanionVoices(before, settings);
+    setTouchDraftZones(preset.enabledZones as AvatarTouchZone[]);
+    setTouchVoiceLanguage(preset.voiceLanguage || '');
+    setTouchGenerateVoice(Boolean(preset.voiceEnabled));
+    setSelectedTouchPresetId(preset.id);
+    setTouchPresetName(preset.name);
+    touchCursorRef.current = {};
+    addToast(`已切换触摸预设「${preset.name}」`, 'success');
+  };
+
+  const deleteStartupPreset = () => {
+    if (!character || !selectedStartupPresetId || settingsGenerating) return;
+    const preset = character.companionTouchSettings?.startupPresets?.find(item => item.id === selectedStartupPresetId);
+    if (!preset || !window.confirm(`删除开机预设「${preset.name}」？`)) return;
+    const before = companionTouchSettingsBase();
+    const after = removeCompanionStartupPreset(before, selectedStartupPresetId);
+    updateCharacter(character.id, { companionTouchSettings: after });
+    cleanupUnreferencedCompanionVoices(before, after);
+    setSelectedStartupPresetId('');
+    setStartupPresetName('');
+    addToast('开机预设已删除；当前草稿仍保留', 'success');
+  };
+
+  const deleteTouchPreset = () => {
+    if (!character || !selectedTouchPresetId || settingsGenerating) return;
+    const preset = character.companionTouchSettings?.touchPresets?.find(item => item.id === selectedTouchPresetId);
+    if (!preset || !window.confirm(`删除触摸预设「${preset.name}」？`)) return;
+    const before = companionTouchSettingsBase();
+    const after = removeCompanionTouchPreset(before, selectedTouchPresetId);
+    updateCharacter(character.id, { companionTouchSettings: after });
+    cleanupUnreferencedCompanionVoices(before, after);
+    setSelectedTouchPresetId('');
+    setTouchPresetName('');
+    addToast('触摸预设已删除；当前反馈仍保留', 'success');
+  };
+
   const patchStartupPerformance = (patch: Partial<AvatarPerformanceDirection>) => {
+    setSelectedStartupPresetId('');
     const editsTimeline = companionPerformanceCuePackMatches(
       normalizeCompanionDialogue(startupLine, character?.name || ''),
       normalizeCompanionDialogue(startupTranslation, character?.name || ''),
@@ -1048,6 +1438,7 @@ const CompanionHome: React.FC = () => {
   };
 
   const patchStartupPrecision = (patch: Partial<AvatarPerformancePrecision>) => {
+    setSelectedStartupPresetId('');
     const editsTimeline = companionPerformanceCuePackMatches(
       normalizeCompanionDialogue(startupLine, character?.name || ''),
       normalizeCompanionDialogue(startupTranslation, character?.name || ''),
@@ -1123,18 +1514,18 @@ const CompanionHome: React.FC = () => {
       addToast(`已选择 ${voiceLanguageLabel(startup.voiceLanguage)}，请填写对应的语音译文`, 'error');
       return;
     }
-    updateCharacter(character.id, prev => ({
-      companionTouchSettings: {
-        enabledZones: prev.companionTouchSettings?.enabledZones || DEFAULT_COMPANION_TOUCH_ZONES,
-        reactions: prev.companionTouchSettings?.reactions || {},
-        ...prev.companionTouchSettings,
-        startup,
-      },
-    }));
+    const saved = saveCompanionStartupPreset(
+      companionTouchSettingsBase(),
+      startup,
+      startupPresetName,
+    );
+    updateCharacter(character.id, { companionTouchSettings: saved.settings });
     setStartupLine(startup.line);
     setStartupTranslation(startup.translation || '');
     setStartupPerformance(normalizeCompanionStartupPerformance(startup.performance));
-    addToast(startup.enabled ? '开机自启演出已保存' : '开机自启已关闭，草稿仍为你保留', 'success');
+    setSelectedStartupPresetId(saved.preset.id);
+    setStartupPresetName(saved.preset.name);
+    addToast(`已保存新的开机预设「${saved.preset.name}」`, 'success');
   };
 
   const previewStartup = () => {
@@ -1210,7 +1601,8 @@ const CompanionHome: React.FC = () => {
       setStartupPerformanceCueIndex(0);
       setStartupPerformanceCuePhase('start');
       setStartupPerformance(cues[0].direction);
-      addToast(`已按台词编排 ${cues.length} 个动作拍点；点击“保存开机演出”后永久复用`, 'success');
+      setSelectedStartupPresetId('');
+      addToast(`已按台词编排 ${cues.length} 个动作拍点；点击“保存为新预设”后永久复用`, 'success');
     } catch (error: any) {
       if (!mountedRef.current || requestToken !== requestTokenRef.current) return;
       console.warn('[companion] startup performance direction failed:', error);
@@ -1271,17 +1663,18 @@ const CompanionHome: React.FC = () => {
         ...voice,
         updatedAt: Date.now(),
       };
-      updateCharacter(character.id, prev => ({
-        companionTouchSettings: {
-          enabledZones: prev.companionTouchSettings?.enabledZones || DEFAULT_COMPANION_TOUCH_ZONES,
-          reactions: prev.companionTouchSettings?.reactions || {},
-          ...prev.companionTouchSettings,
-          startup,
-        },
-      }));
+      const before = companionTouchSettingsBase();
+      const after: CompanionTouchSettings = {
+        ...before,
+        startup,
+        activeStartupPresetId: undefined,
+      };
+      updateCharacter(character.id, { companionTouchSettings: after });
+      cleanupUnreferencedCompanionVoices(before, after);
       setStartupLine(originalText);
       setStartupTranslation(translation);
-      addToast('开机语音包已生成并永久保存在本地，之后开机直接复用', 'success');
+      setSelectedStartupPresetId('');
+      addToast('开机语音包已生成并永久保存在本地；保存为预设后可随时切换', 'success');
     } catch (error: any) {
       if (!mountedRef.current || requestToken !== requestTokenRef.current) return;
       console.warn('[companion] startup voice pack generation failed:', error);
@@ -1348,19 +1741,19 @@ const CompanionHome: React.FC = () => {
         voiceFailures = voiceResult.failures.length;
       }
 
-      updateCharacter(character.id, prev => ({
-        companionTouchSettings: {
-          ...prev.companionTouchSettings,
-          enabledZones: touchDraftZones,
-          reactions,
-          voiceLanguage: touchVoiceLanguage,
-          voiceEnabled: touchGenerateVoice,
-          voiceGeneratedCount: voiceGenerated,
-          generatedAt: Date.now(),
-        },
-      }));
-      const keepVoiceIds = collectAvatarTouchVoiceAssetIds(reactions);
-      void cleanupAvatarTouchVoiceAssets(character.companionTouchSettings?.reactions, keepVoiceIds);
+      const before = companionTouchSettingsBase();
+      const saved = saveCompanionTouchPreset(before, {
+        enabledZones: touchDraftZones,
+        reactions,
+        voiceLanguage: touchVoiceLanguage,
+        voiceEnabled: touchGenerateVoice,
+        voiceGeneratedCount: voiceGenerated,
+        generatedAt: Date.now(),
+      }, touchPresetName);
+      updateCharacter(character.id, { companionTouchSettings: saved.settings });
+      cleanupUnreferencedCompanionVoices(before, saved.settings);
+      setSelectedTouchPresetId(saved.preset.id);
+      setTouchPresetName(saved.preset.name);
       touchCursorRef.current = {};
       trackEvent('生成桌面触碰反馈', {
         形象: activeCompanionSource === 'upload'
@@ -1369,7 +1762,7 @@ const CompanionHome: React.FC = () => {
         语音: touchGenerateVoice,
       });
       const voiceSummary = touchGenerateVoice ? ` · 本地语音 ${voiceGenerated}/${voiceTotal}` : '';
-      addToast(`已为 ${touchDraftZones.length} 个部位准备本地反馈包${voiceSummary}`, 'success');
+      addToast(`已保存新的触摸预设「${saved.preset.name}」${voiceSummary}`, 'success');
       if (voiceFailures) {
         addToast(`${voiceFailures} 条语音未能保存，触摸时只演动作与台词，不会临时调用 TTS`, 'info');
       }
@@ -1475,9 +1868,14 @@ const CompanionHome: React.FC = () => {
     stopTouchVoice();
     setLastHit(hit);
     const touchForce = resolveAvatarTouchForce(hit);
+    const keepBuiltinSullyHeadClose = (direction: AvatarPerformanceDirection): AvatarPerformanceDirection => (
+      isBuiltinSullyLive2D(character.videoAvatar) && (hit.zone === 'head' || hit.zone === 'face')
+        ? { ...direction, camera: 'close' }
+        : direction
+    );
     setRipple({ nonce: hit.nonce, x: hit.normalizedX, y: hit.normalizedY, force: touchForce });
     showTouchBanner(hit, `你戳了戳${character.name}的${avatarTouchTargetLabel(hit)}`);
-    setPerformance(applyAvatarTouchForce(buildImmediateTouchPerformance(hit.zone), hit));
+    setPerformance(applyAvatarTouchForce(keepBuiltinSullyHeadClose(buildImmediateTouchPerformance(hit.zone)), hit));
     setMotionState('speaking');
 
     const settings = character.companionTouchSettings;
@@ -1507,7 +1905,7 @@ const CompanionHome: React.FC = () => {
       if (!mountedRef.current) return;
       setLine({ text, translation: translation || undefined, label: `触摸 · ${avatarTouchZoneLabel(hit.zone)}`, kind: 'touch' });
       setPerformance(applyAvatarTouchForce(
-        reaction.performance || buildImmediateTouchPerformance(hit.zone),
+        keepBuiltinSullyHeadClose(reaction.performance || buildImmediateTouchPerformance(hit.zone)),
         hit,
       ));
       setMotionState('speaking');
@@ -1544,7 +1942,9 @@ const CompanionHome: React.FC = () => {
   const hh = String(virtualTime.hours).padStart(2, '0');
   const mm = String(virtualTime.minutes).padStart(2, '0');
 
-  const activeCompanionFraming = editing ? framingDraft : (companionFraming || defaultCompanionFraming);
+  const compositionFramingDraft = compositionFramingMode === 'face' ? faceFramingDraft : framingDraft;
+  const setCompositionFramingDraft = compositionFramingMode === 'face' ? setFaceFramingDraft : setFramingDraft;
+  const activeCompanionFraming = editing ? compositionFramingDraft : (companionFraming || defaultCompanionFraming);
   const activeCompanionCrop = editing ? cropDraft : (companionCrop || DEFAULT_STAGE_CROP);
   const cropAdjusted = !cropIsDefault(activeCompanionCrop);
   const framingScaleMin = character.videoAvatar?.format === 'live2d' ? 0.55 : 0.5;
@@ -1552,6 +1952,8 @@ const CompanionHome: React.FC = () => {
   const framingOffsetXMax = character.videoAvatar?.format === 'live2d' ? 1.4 : 0.9;
   const framingOffsetYMax = character.videoAvatar?.format === 'live2d' ? 3.2 : 0.9;
   const savedTouchSettings = character.companionTouchSettings;
+  const startupPresets = savedTouchSettings?.startupPresets || [];
+  const touchPresets = savedTouchSettings?.touchPresets || [];
   const preparedReactionCount = Object.values(savedTouchSettings?.reactions || {})
     .reduce((total, reactions) => total + (reactions?.length || 0), 0);
   const preparedVoiceCount = Object.values(savedTouchSettings?.reactions || {})
@@ -1599,10 +2001,6 @@ const CompanionHome: React.FC = () => {
         @keyframes companion-dialog-in {
           from { opacity:0; transform:translateY(10px); }
           to { opacity:1; transform:translateY(0); }
-        }
-        @keyframes companion-static-expression-in {
-          from { opacity:.35; filter:brightness(1.08); }
-          to { opacity:1; filter:brightness(1); }
         }
         @keyframes companion-cursor { 0%,100% { opacity:.85; } 50% { opacity:.1; } }
         @keyframes companion-thinking-dot {
@@ -1949,15 +2347,15 @@ const CompanionHome: React.FC = () => {
             value={staticPortraitValue}
             characterName={character.name}
             spriteConfig={character.spriteConfig}
-            expressionKey={staticExpressionKey}
             touchEnabled={!editing && !touchSettingsOpen && !wardrobeOpen}
             onAvatarTouch={hit => { void respondToTouch(hit); }}
           />
         ) : (
+          /* Wardrobe onboarding owns its own WebGL preview; suspend this one. */
           <VRMVideoCallStage
             characterName={character.name}
             fallbackAvatar={character.avatar}
-            model={character.videoAvatar}
+            model={wardrobeLive2DSettings ? undefined : character.videoAvatar}
             motionState={motionState}
             audioFeed={getCompanionAudioFeed()}
             headMotionLocked={startupHeadLocked}
@@ -1967,12 +2365,15 @@ const CompanionHome: React.FC = () => {
             accentColor={accentColor}
             baseFraming={activeCompanionFraming}
             framingEditable={editing}
-            onFramingChange={editing ? setFramingDraft : undefined}
+            onFramingChange={editing && compositionFramingMode !== 'touch' ? setCompositionFramingDraft : undefined}
             stageCrop={activeCompanionCrop}
-            showCropGuide={editing && editingPanel === 'character'}
+            showCropGuide={editing && editingPanel === 'character' && compositionFramingMode === 'base'}
+            touchRegions={editing && character.videoAvatar?.format === 'live2d' ? touchRegionsDraft : undefined}
+            touchRegionEditingZone={editing && editingPanel === 'character' && compositionFramingMode === 'touch' && character.videoAvatar?.format === 'live2d' ? touchRegionEditingZone : undefined}
+            onTouchRegionsChange={editing ? setTouchRegionsDraft : undefined}
             onChooseModel={() => openApp(AppID.Call)}
             onExpressionsDiscovered={setVrmExpressions}
-            onAvatarTouch={hit => { void respondToTouch(hit); }}
+            onAvatarTouch={editing ? undefined : hit => { void respondToTouch(hit); }}
             onModelReady={handleStageModelReady}
             onModelError={handleStageModelError}
             touchImpulseNonce={lastHit?.nonce}
@@ -2116,19 +2517,47 @@ const CompanionHome: React.FC = () => {
         wardrobeActions={wardrobeActions}
         activeActionId={character.videoAvatar?.format === 'live2d' ? character.videoAvatar.activeWardrobeActionId : undefined}
         onSelect={selectWardrobeAction}
+        modelOutfits={modelOutfits}
+        activeModelAssetId={character.videoAvatar?.assetId}
+        onSelectModel={selectModelOutfit}
+        onDeleteModel={deleteModelOutfit}
         staticOutfits={staticOutfits}
         activeStaticOutfitId={activeStaticOutfitId}
         onSelectStaticOutfit={selectStaticOutfit}
+        onDeleteStaticOutfit={deleteStaticOutfit}
+        onDeleteWardrobeAction={deleteWardrobeAction}
         staticMode={staticCompanionActive}
         staticSource={staticCompanionActive ? activeCompanionSource : undefined}
         discoveryHint={wardrobeDiscoveryOpened}
         onOpenComposition={openCompositionEditor}
+        onImportOutfit={importWardrobeOutfit}
+        importBusy={wardrobeImportBusy}
         onManageActions={() => {
           closeWardrobe();
           openApp(activeCompanionSource === 'date' ? AppID.Date : activeCompanionSource === 'upload' ? AppID.Appearance : AppID.Call);
         }}
         onClose={closeWardrobe}
       />
+
+      {wardrobeLive2DSettings && (
+        <Live2DActionSettings
+          config={wardrobeLive2DSettings}
+          characterName={character.name}
+          accentColor={uiTint}
+          setupMode="import"
+          onClose={() => setWardrobeLive2DSettings(null)}
+          onSave={config => {
+            updateCharacter(character.id, prev => ({
+              videoAvatar: prev.videoAvatar?.assetId === config.assetId ? config : prev.videoAvatar,
+              videoAvatarWardrobe: (prev.videoAvatarWardrobe || []).map(model => (
+                model.assetId === config.assetId ? config : model
+              )),
+            }));
+            setWardrobeLive2DSettings(null);
+            addToast('Live2D 衣橱模型已保存', 'success');
+          }}
+        />
+      )}
 
       <ScheduleFullscreenViewer
         open={scheduleViewerOpen}
@@ -2320,7 +2749,10 @@ const CompanionHome: React.FC = () => {
                   aria-checked={startupEnabled}
                   data-testid="companion-startup-enabled"
                   disabled={settingsGenerating}
-                  onClick={() => setStartupEnabled(current => !current)}
+                  onClick={() => {
+                    setSelectedStartupPresetId('');
+                    setStartupEnabled(current => !current);
+                  }}
                   className="relative mt-0.5 h-5 w-9 shrink-0 rounded-full border transition disabled:opacity-45"
                   style={{
                     borderColor: startupEnabled ? uiTint : 'rgba(255,255,255,.24)',
@@ -2336,6 +2768,27 @@ const CompanionHome: React.FC = () => {
 
               {startupSettingsExpanded && (
               <div id="companion-startup-settings-body" data-testid="companion-startup-settings-body">
+              <div className="mt-3 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                <select
+                  value={selectedStartupPresetId}
+                  disabled={settingsGenerating || !startupPresets.length}
+                  onChange={event => selectStartupPreset(event.target.value)}
+                  data-testid="companion-startup-preset-select"
+                  aria-label="选择开机预设"
+                  className="min-w-0 border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 outline-none disabled:opacity-45"
+                >
+                  <option value="">{startupPresets.length ? `选择已保存预设（${startupPresets.length}）` : '还没有开机预设'}</option>
+                  {startupPresets.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
+                </select>
+                <button
+                  type="button"
+                  disabled={settingsGenerating || !selectedStartupPresetId}
+                  onClick={deleteStartupPreset}
+                  data-testid="companion-delete-startup-preset"
+                  aria-label="删除所选开机预设"
+                  className="flex h-9 w-9 items-center justify-center border border-white/12 text-white/58 disabled:opacity-30"
+                ><Trash size={14} /></button>
+              </div>
               <p className="mt-3 text-[9px] leading-relaxed text-white/48">
                 中文原文、语音译文和动作都由你手动填写。每次刷新或重启后演一次；从 App 返回桌面不会重复播放。演出期间暂停随机转头。
               </p>
@@ -2348,7 +2801,10 @@ const CompanionHome: React.FC = () => {
                 value={startupLine}
                 maxLength={180}
                 disabled={settingsGenerating}
-                onChange={event => setStartupLine(event.target.value)}
+                onChange={event => {
+                  setSelectedStartupPresetId('');
+                  setStartupLine(event.target.value);
+                }}
                 placeholder="手动填写一句只有这个角色会说的话。"
                 className="mt-1 min-h-[72px] w-full resize-y border border-white/12 bg-black/15 px-3 py-2 text-[11px] leading-relaxed text-white outline-none placeholder:text-white/24 focus:border-white/30 disabled:opacity-45"
               />
@@ -2360,7 +2816,10 @@ const CompanionHome: React.FC = () => {
                 data-testid="companion-startup-voice-language"
                 value={startupVoiceLanguage}
                 disabled={settingsGenerating}
-                onChange={event => setStartupVoiceLanguage(event.target.value)}
+                onChange={event => {
+                  setSelectedStartupPresetId('');
+                  setStartupVoiceLanguage(event.target.value);
+                }}
                 className="mt-1 w-full border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 outline-none disabled:opacity-45"
               >
                 {VOICE_LANGUAGE_OPTIONS.map(option => (
@@ -2377,7 +2836,10 @@ const CompanionHome: React.FC = () => {
                 value={startupTranslation}
                 maxLength={240}
                 disabled={settingsGenerating}
-                onChange={event => setStartupTranslation(event.target.value)}
+                onChange={event => {
+                  setSelectedStartupPresetId('');
+                  setStartupTranslation(event.target.value);
+                }}
                 placeholder={startupVoiceLanguage ? `手动填写 ${voiceLanguageLabel(startupVoiceLanguage)} 译文。` : '默认中文时可留空，将直接朗读上面的中文原文。'}
                 className="mt-1 min-h-[64px] w-full resize-y border border-white/12 bg-black/15 px-3 py-2 text-[11px] leading-relaxed text-white outline-none placeholder:text-white/24 focus:border-white/30 disabled:opacity-45"
               />
@@ -2465,13 +2927,33 @@ const CompanionHome: React.FC = () => {
                       value={selectedStartupCue?.holdMs || 900}
                       disabled={settingsGenerating}
                       data-testid="companion-startup-cue-hold"
-                      onChange={event => setStartupPerformanceCues(cues => cues.map((cue, index) => index === selectedStartupCueIndex ? { ...cue, holdMs: Number(event.target.value) } : cue))}
+                      onChange={event => {
+                        setSelectedStartupPresetId('');
+                        setStartupPerformanceCues(cues => cues.map((cue, index) => index === selectedStartupCueIndex ? { ...cue, holdMs: Number(event.target.value) } : cue));
+                      }}
                       className="mt-1 h-1 w-full"
                       style={{ accentColor: uiTint }}
                     />
                   </label>
                 </div>
               )}
+
+              <label className="mt-3 block text-[8px] tracking-[0.12em] text-white/48" htmlFor="companion-startup-preset-name">
+                新预设名称
+              </label>
+              <input
+                id="companion-startup-preset-name"
+                data-testid="companion-startup-preset-name"
+                value={startupPresetName}
+                maxLength={40}
+                disabled={settingsGenerating}
+                onChange={event => setStartupPresetName(event.target.value)}
+                placeholder={`开机演出 ${startupPresets.length + 1}`}
+                className="mt-1 w-full border border-white/12 bg-black/15 px-3 py-2 text-[10px] text-white outline-none placeholder:text-white/24 disabled:opacity-45"
+              />
+              <div className="mt-1 text-[7px] leading-relaxed text-white/30">
+                保存始终新建一套，不会覆盖下拉菜单里的旧预设；已生成语音也随各自预设独立保留。
+              </div>
 
               <button
                 type="button"
@@ -2642,7 +3124,7 @@ const CompanionHome: React.FC = () => {
                 className="mt-3 w-full border py-2.5 text-[10px] font-semibold tracking-wide transition active:scale-[.99] disabled:opacity-45"
                 style={{ borderColor: `${uiTint}9c`, background: `${uiTint}18`, color: uiTint }}
               >
-                保存开机演出
+                保存为新预设
               </button>
               </div>
               )}
@@ -2652,6 +3134,27 @@ const CompanionHome: React.FC = () => {
               <span className="h-px flex-1 bg-white/10" />
               触摸反馈包
               <span className="h-px flex-1 bg-white/10" />
+            </div>
+            <div className="mt-4 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+              <select
+                value={selectedTouchPresetId}
+                disabled={settingsGenerating || !touchPresets.length}
+                onChange={event => selectTouchPreset(event.target.value)}
+                data-testid="companion-touch-preset-select"
+                aria-label="选择触摸预设"
+                className="min-w-0 border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 outline-none disabled:opacity-45"
+              >
+                <option value="">{touchPresets.length ? `选择已保存预设（${touchPresets.length}）` : '还没有触摸预设'}</option>
+                {touchPresets.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
+              </select>
+              <button
+                type="button"
+                disabled={settingsGenerating || !selectedTouchPresetId}
+                onClick={deleteTouchPreset}
+                data-testid="companion-delete-touch-preset"
+                aria-label="删除所选触摸预设"
+                className="flex h-9 w-9 items-center justify-center border border-white/12 text-white/58 disabled:opacity-30"
+              ><Trash size={14} /></button>
             </div>
             <div className="mt-4 grid grid-cols-2 gap-2">
               {(['head', 'face', 'hand', 'body', 'other'] as AvatarTouchZone[]).map(zone => {
@@ -2691,7 +3194,10 @@ const CompanionHome: React.FC = () => {
               data-testid="companion-touch-voice-language"
               value={touchVoiceLanguage}
               disabled={settingsGenerating}
-              onChange={event => setTouchVoiceLanguage(event.target.value)}
+              onChange={event => {
+                setSelectedTouchPresetId('');
+                setTouchVoiceLanguage(event.target.value);
+              }}
               className="mt-1 w-full border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 outline-none disabled:opacity-45"
             >
               {VOICE_LANGUAGE_OPTIONS.map(option => (
@@ -2708,7 +3214,10 @@ const CompanionHome: React.FC = () => {
               aria-checked={touchGenerateVoice}
               disabled={settingsGenerating || !touchVoiceAvailable}
               data-testid="companion-touch-generate-voice"
-              onClick={() => setTouchGenerateVoice(current => !current)}
+              onClick={() => {
+                setSelectedTouchPresetId('');
+                setTouchGenerateVoice(current => !current);
+              }}
               className="mt-3 flex w-full items-center gap-3 border px-3 py-2.5 text-left transition active:scale-[.99] disabled:opacity-45"
               style={{
                 borderColor: touchGenerateVoice ? `${uiTint}9f` : 'rgba(255,255,255,.12)',
@@ -2737,6 +3246,23 @@ const CompanionHome: React.FC = () => {
               </span>
             </button>
 
+            <label className="mt-3 block text-[8px] tracking-[0.12em] text-white/48" htmlFor="companion-touch-preset-name">
+              新预设名称
+            </label>
+            <input
+              id="companion-touch-preset-name"
+              data-testid="companion-touch-preset-name"
+              value={touchPresetName}
+              maxLength={40}
+              disabled={settingsGenerating}
+              onChange={event => setTouchPresetName(event.target.value)}
+              placeholder={`触摸反馈 ${touchPresets.length + 1}`}
+              className="mt-1 w-full border border-white/12 bg-black/15 px-3 py-2 text-[10px] text-white outline-none placeholder:text-white/24 disabled:opacity-45"
+            />
+            <div className="mt-1 text-[7px] leading-relaxed text-white/30">
+              每次生成都会保存为新预设；旧反馈包和它引用的本地语音不会被覆盖。
+            </div>
+
             <button
               onClick={() => { void generateTouchReactionPack(); }}
               disabled={settingsGenerating || !touchDraftZones.length}
@@ -2749,7 +3275,7 @@ const CompanionHome: React.FC = () => {
                 ? touchVoiceProgress
                   ? `正在合成本地语音 ${touchVoiceProgress.completed}/${touchVoiceProgress.total}…`
                   : `正在生成${touchPackContentLabel}…`
-                : preparedReactionCount ? '重新生成反馈包' : '一次生成反馈包'}
+                : '生成并保存新预设'}
             </button>
             <div className="mt-2 text-center text-[8px] tracking-wide text-white/30">
               {savedTouchSettings?.generatedAt
@@ -2965,20 +3491,20 @@ const CompanionHome: React.FC = () => {
           {character.videoAvatar && editingPanel === 'character' && (
             <div
               className="pointer-events-none absolute left-4 z-40 border-l px-3 py-2 text-left backdrop-blur-md"
-              style={{ top: 'max(2.4rem, calc(var(--safe-top, 0px) + .8rem))', right: 'min(84vw, 22rem)', borderColor: `${uiTint}90`, background: `${palette.panelBottom}a8` }}
+              style={{ top: 'max(2.4rem, calc(var(--safe-top, 0px) + .8rem))', right: compositionEditorCollapsed ? '3rem' : 'min(84vw, 22rem)', borderColor: `${uiTint}90`, background: `${palette.panelBottom}a8`, transition: 'right 200ms ease' }}
             >
               <span className="text-[9px] leading-relaxed text-white/78">拖动角色 · 双指缩放 · 虚线框为可视区</span>
             </div>
           )}
           <div
-            className="absolute bottom-0 right-0 top-0 z-50 w-[min(82vw,21rem)]"
-            style={{ animation: 'companion-inspector-in 240ms cubic-bezier(.2,.8,.2,1) both' }}
+            className={`absolute bottom-0 right-0 top-0 z-50 w-[min(82vw,21rem)] transition-transform duration-200 ease-out ${compositionEditorCollapsed ? 'pointer-events-none translate-x-full' : 'translate-x-0'}`}
             data-testid="companion-composition-editor"
             data-placement="right-inspector"
+            data-collapsed={compositionEditorCollapsed ? 'true' : 'false'}
           >
             <section
               className="h-full overflow-y-auto border-l border-white/20 px-4 pb-5 text-white shadow-2xl backdrop-blur-2xl no-scrollbar"
-              style={{ paddingTop: 'max(1rem, calc(var(--safe-top, 0px) + .75rem))', paddingBottom: 'max(1.25rem, calc(var(--safe-bottom, 0px) + 1rem))', background: `linear-gradient(165deg, ${palette.panelTop}fa, ${palette.panelBottom}fd)`, boxShadow: `-24px 0 64px ${palette.shadow}bd, inset 1px 0 0 ${uiTint}28` }}
+              style={{ paddingTop: 'max(1rem, calc(var(--safe-top, 0px) + .75rem))', paddingBottom: 'max(1.25rem, calc(var(--safe-bottom, 0px) + 1rem))', background: `linear-gradient(165deg, ${palette.panelTop}fa, ${palette.panelBottom}fd)`, boxShadow: `-24px 0 64px ${palette.shadow}bd, inset 1px 0 0 ${uiTint}28`, animation: 'companion-inspector-in 240ms cubic-bezier(.2,.8,.2,1) both' }}
             >
               <header className="flex items-center justify-between gap-2">
                 <div>
@@ -2986,6 +3512,14 @@ const CompanionHome: React.FC = () => {
                   <div className="mt-0.5 text-[8px] tracking-[0.13em] text-white/36">CHARACTER INSPECTOR</div>
                 </div>
                 <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setCompositionEditorCollapsed(true)}
+                    className="flex h-7 w-7 items-center justify-center rounded-full border border-white/15 text-white/55 transition active:scale-90"
+                    aria-label="暂时折叠角色构图面板"
+                    title="暂时折叠"
+                    data-testid="companion-collapse-composition"
+                  ><CaretRight size={12} weight="bold" /></button>
                   <button onClick={cancelCompositionEditor} className="rounded-full border border-white/15 px-3 py-1.5 text-[10px] text-white/60 active:scale-95">取消</button>
                   <button
                     onClick={saveCompositionEditor}
@@ -3048,22 +3582,136 @@ const CompanionHome: React.FC = () => {
                           </div>
                         </div>
                       )}
-                      <div className="flex items-center justify-between">
-                        <div className="text-[9px] font-semibold tracking-[0.16em] text-white/48">大小与位置</div>
+                      {character.videoAvatar.format === 'live2d' && !builtinSullyAvatar && (
+                        <div className="mb-3 rounded-2xl border border-white/10 bg-black/15 p-2.5" data-testid="companion-live2d-texture-quality-picker">
+                          <div>
+                            <div className="text-[9px] font-semibold tracking-[0.16em] text-white/48">运行纹理画质</div>
+                            <div className="mt-0.5 text-[8px] leading-relaxed text-white/32">默认 2K 更稳；4K 会占用更多内存，并单独建立运行缓存</div>
+                          </div>
+                          <div className="mt-2 grid grid-cols-2 gap-1.5">
+                            {([
+                              { value: 'balanced' as const, label: '轻量 2K' },
+                              { value: 'hd' as const, label: '高清 4K' },
+                            ]).map(option => {
+                              const currentQuality = character.videoAvatar?.format === 'live2d' && character.videoAvatar.textureQuality === 'hd' ? 'hd' : 'balanced';
+                              const active = currentQuality === option.value;
+                              return (
+                                <button
+                                  key={option.value}
+                                  type="button"
+                                  onClick={() => chooseImportedLive2DTextureQuality(option.value)}
+                                  className={`rounded-xl border py-2 text-[9px] font-medium transition active:scale-[.98] ${active ? 'bg-white/14 text-white' : 'border-white/8 bg-white/[.025] text-white/42'}`}
+                                  style={active ? { borderColor: `${uiTint}88` } : undefined}
+                                  data-testid={`companion-live2d-texture-quality-${option.value}`}
+                                >{active && <Check size={10} weight="bold" className="mr-1 inline" />}{option.label}</button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                      <div className={`mb-3 grid gap-1.5 ${character.videoAvatar.format === 'live2d' ? 'grid-cols-3' : 'grid-cols-2'}`} data-testid="companion-framing-mode-picker">
                         <button
-                          onClick={() => { setFramingDraft(defaultCompanionFraming); setCropDraft(DEFAULT_STAGE_CROP); }}
+                          type="button"
+                          aria-pressed={compositionFramingMode === 'base'}
+                          onClick={() => setCompositionFramingMode('base')}
+                          className={`border px-2 py-2 text-[9px] transition ${compositionFramingMode === 'base' ? 'bg-white/12 text-white' : 'border-white/10 text-white/42'}`}
+                          style={compositionFramingMode === 'base' ? { borderColor: `${uiTint}88` } : undefined}
+                        >日常构图</button>
+                        <button
+                          type="button"
+                          aria-pressed={compositionFramingMode === 'face'}
+                          data-testid="companion-face-anchor-mode"
+                          onClick={() => {
+                            setCompositionFramingMode('face');
+                            setFaceAnchorDraftEnabled(true);
+                          }}
+                          className={`border px-2 py-2 text-[9px] transition ${compositionFramingMode === 'face' ? 'bg-white/12 text-white' : 'border-white/10 text-white/42'}`}
+                          style={compositionFramingMode === 'face' ? { borderColor: `${uiTint}88` } : undefined}
+                        >面部特写锚点{faceAnchorDraftEnabled ? ' · 已设' : ''}</button>
+                        {character.videoAvatar.format === 'live2d' && (
+                          <button
+                            type="button"
+                            aria-pressed={compositionFramingMode === 'touch'}
+                            data-testid="companion-touch-region-mode"
+                            onClick={() => setCompositionFramingMode('touch')}
+                            className={`border px-2 py-2 text-[9px] transition ${compositionFramingMode === 'touch' ? 'bg-white/12 text-white' : 'border-white/10 text-white/42'}`}
+                            style={compositionFramingMode === 'touch' ? { borderColor: `${uiTint}88` } : undefined}
+                          >触摸圈选{touchRegionsDraft.length ? ` · ${touchRegionsDraft.length}` : ''}</button>
+                        )}
+                      </div>
+                      {compositionFramingMode === 'face' && (
+                        <div className="mb-3 border-l px-2.5 py-2 text-[8px] leading-relaxed text-white/48" style={{ borderColor: `${uiTint}88`, background: `${uiTint}0f` }}>
+                          把脸拖到画面中心并调整到理想大小。保存后，摸脸或 AI 使用「拉近」镜头只会落到这个位置，不再按全身比例猜。
+                        </div>
+                      )}
+                      {compositionFramingMode === 'touch' && character.videoAvatar.format === 'live2d' && (
+                        <div className="mb-3 rounded-2xl border border-white/10 bg-black/15 p-2.5" data-testid="companion-touch-region-editor-panel">
+                          <div className="text-[8px] leading-relaxed text-white/55">
+                            先选部位，再在左侧模型上按住拖动，圈出椭圆区域。同一部位可画多个圈；圈会跟随这个模型，不受半身、全身或构图缩放影响。
+                          </div>
+                          <div className="mt-2 grid grid-cols-5 gap-1">
+                            {([
+                              { zone: 'head', label: '头', color: '#f5c86a' },
+                              { zone: 'face', label: '脸', color: '#ff8fb7' },
+                              { zone: 'hand', label: '手', color: '#77d9dd' },
+                              { zone: 'body', label: '身体', color: '#9ba8ff' },
+                              { zone: 'other', label: '其他', color: '#c6cbd5' },
+                            ] as const).map(item => {
+                              const count = touchRegionsDraft.filter(region => region.zone === item.zone).length;
+                              const active = touchRegionEditingZone === item.zone;
+                              return (
+                                <button
+                                  key={item.zone}
+                                  type="button"
+                                  onClick={() => setTouchRegionEditingZone(item.zone)}
+                                  className={`min-w-0 rounded-xl border px-1 py-2 text-[8px] transition active:scale-95 ${active ? 'bg-white/12 text-white' : 'border-white/8 text-white/42'}`}
+                                  style={active ? { borderColor: item.color, boxShadow: `inset 0 0 14px ${item.color}18` } : undefined}
+                                  data-testid={`companion-touch-region-zone-${item.zone}`}
+                                >
+                                  <span className="mx-auto mb-1 block h-1.5 w-1.5 rounded-full" style={{ background: item.color }} />
+                                  {item.label}{count ? ` ${count}` : ''}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="mt-2 flex items-center justify-between border-t border-white/8 pt-2">
+                            <span className="text-[8px] text-white/35">重叠时优先较小的圈</span>
+                            <span className="flex gap-1">
+                              <button
+                                type="button"
+                                disabled={!touchRegionsDraft.some(region => region.zone === touchRegionEditingZone)}
+                                onClick={() => setTouchRegionsDraft(current => current.filter(region => region.zone !== touchRegionEditingZone))}
+                                className="rounded-full px-2 py-1 text-[8px] text-rose-200/65 disabled:opacity-25"
+                              >清除此部位</button>
+                              <button
+                                type="button"
+                                disabled={!touchRegionsDraft.length}
+                                onClick={() => setTouchRegionsDraft([])}
+                                className="rounded-full px-2 py-1 text-[8px] text-rose-200/65 disabled:opacity-25"
+                              >全部清除</button>
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                      <div className="flex items-center justify-between">
+                        <div className="text-[9px] font-semibold tracking-[0.16em] text-white/48">{compositionFramingMode === 'face' ? '面部锚点大小与位置' : compositionFramingMode === 'touch' ? '圈选时的模型位置' : '大小与位置'}</div>
+                        <button
+                          onClick={() => {
+                            if (compositionFramingMode === 'face') setFaceFramingDraft(makeFaceFramingSeed());
+                            else { setFramingDraft(defaultCompanionFraming); setCropDraft(DEFAULT_STAGE_CROP); }
+                          }}
                           className="inline-flex items-center gap-1 rounded-full border border-white/12 px-2 py-1 text-[9px] text-white/50 active:scale-95"
                         >
-                          <ArrowClockwise size={10} weight="bold" /> 全部重置
+                          <ArrowClockwise size={10} weight="bold" /> {compositionFramingMode === 'face' ? '重置锚点' : compositionFramingMode === 'touch' ? '重置构图' : '全部重置'}
                         </button>
                       </div>
 
                       <label className="mt-2.5 block">
-                        <span className="flex items-center justify-between text-[9px] text-white/58"><span>角色大小</span><b className="font-mono text-white/82">{framingDraft.scale.toFixed(2)}×</b></span>
+                        <span className="flex items-center justify-between text-[9px] text-white/58"><span>{compositionFramingMode === 'face' ? '特写大小' : '角色大小'}</span><b className="font-mono text-white/82">{compositionFramingDraft.scale.toFixed(2)}×</b></span>
                         <span className="mt-1.5 flex items-center gap-2">
-                          <button onClick={() => setFramingDraft(current => ({ ...current, scale: Math.max(framingScaleMin, current.scale - .1) }))} className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-white/12 bg-white/[.04] active:scale-90"><Minus size={11} /></button>
-                          <input type="range" min={framingScaleMin} max={framingScaleMax} step="0.01" value={framingDraft.scale} onChange={event => setFramingDraft(current => ({ ...current, scale: Number(event.target.value) }))} className="h-1.5 min-w-0 flex-1 cursor-pointer accent-fuchsia-300" data-testid="companion-framing-scale" />
-                          <button onClick={() => setFramingDraft(current => ({ ...current, scale: Math.min(framingScaleMax, current.scale + .1) }))} className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-white/12 bg-white/[.04] active:scale-90"><Plus size={11} /></button>
+                          <button onClick={() => setCompositionFramingDraft(current => ({ ...current, scale: Math.max(framingScaleMin, current.scale - .1) }))} className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-white/12 bg-white/[.04] active:scale-90"><Minus size={11} /></button>
+                          <input type="range" min={framingScaleMin} max={framingScaleMax} step="0.01" value={compositionFramingDraft.scale} onChange={event => setCompositionFramingDraft(current => ({ ...current, scale: Number(event.target.value) }))} className="h-1.5 min-w-0 flex-1 cursor-pointer accent-fuchsia-300" data-testid={compositionFramingMode === 'face' ? 'companion-face-framing-scale' : 'companion-framing-scale'} />
+                          <button onClick={() => setCompositionFramingDraft(current => ({ ...current, scale: Math.min(framingScaleMax, current.scale + .1) }))} className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-white/12 bg-white/[.04] active:scale-90"><Plus size={11} /></button>
                         </span>
                       </label>
 
@@ -3072,16 +3720,20 @@ const CompanionHome: React.FC = () => {
                         ['offsetY', '上下位置', framingOffsetYMax],
                       ] as const).map(([key, label, limit]) => (
                         <label key={key} className="mt-2.5 block">
-                          <span className="flex items-center justify-between text-[9px] text-white/58"><span>{label}</span><b className="font-mono text-white/82">{Math.round(framingDraft[key] * 100)}%</b></span>
-                          <input type="range" min={-limit} max={limit} step="0.01" value={framingDraft[key]} onChange={event => setFramingDraft(current => ({ ...current, [key]: Number(event.target.value) }))} className="mt-1.5 h-1.5 w-full cursor-pointer accent-fuchsia-300" data-testid={`companion-framing-${key}`} />
+                          <span className="flex items-center justify-between text-[9px] text-white/58"><span>{label}</span><b className="font-mono text-white/82">{Math.round(compositionFramingDraft[key] * 100)}%</b></span>
+                          <input type="range" min={-limit} max={limit} step="0.01" value={compositionFramingDraft[key]} onChange={event => setCompositionFramingDraft(current => ({ ...current, [key]: Number(event.target.value) }))} className="mt-1.5 h-1.5 w-full cursor-pointer accent-fuchsia-300" data-testid={`companion-${compositionFramingMode === 'face' ? 'face-' : ''}framing-${key}`} />
                         </label>
                       ))}
                       <div className="mt-2 flex gap-2">
-                        <button onClick={() => setFramingDraft(current => ({ ...current, offsetX: 0, offsetY: 0 }))} className="flex-1 rounded-xl border border-white/12 bg-white/[.045] py-2 text-[9px] text-white/58 active:scale-[.98]"><ArrowsOutCardinal className="mr-1 inline" size={11} />角色居中</button>
-                        <button onClick={() => setFramingDraft(defaultCompanionFraming)} className="flex-1 rounded-xl border border-white/12 bg-white/[.045] py-2 text-[9px] text-white/58 active:scale-[.98]">适配舞台</button>
+                        <button onClick={() => setCompositionFramingDraft(current => ({ ...current, offsetX: 0, offsetY: 0 }))} className="flex-1 rounded-xl border border-white/12 bg-white/[.045] py-2 text-[9px] text-white/58 active:scale-[.98]"><ArrowsOutCardinal className="mr-1 inline" size={11} />角色居中</button>
+                        {compositionFramingMode === 'face' ? (
+                          <button onClick={() => { setFaceAnchorDraftEnabled(false); setCompositionFramingMode('base'); }} className="flex-1 rounded-xl border border-rose-300/20 bg-rose-950/20 py-2 text-[9px] text-rose-200/65 active:scale-[.98]">清除锚点</button>
+                        ) : (
+                          <button onClick={() => setFramingDraft(defaultCompanionFraming)} className="flex-1 rounded-xl border border-white/12 bg-white/[.045] py-2 text-[9px] text-white/58 active:scale-[.98]">适配舞台</button>
+                        )}
                       </div>
 
-                      <div className="mt-3 border-t border-white/10 pt-3">
+                      {compositionFramingMode === 'base' && <div className="mt-3 border-t border-white/10 pt-3">
                         <div className="flex items-center justify-between">
                           <div>
                             <div className="text-[9px] font-semibold tracking-[0.16em] text-white/48">自定义裁剪</div>
@@ -3099,7 +3751,7 @@ const CompanionHome: React.FC = () => {
                             </label>
                           ))}
                         </div>
-                      </div>
+                      </div>}
                     </>
                   )}
                 </div>
@@ -3168,6 +3820,19 @@ const CompanionHome: React.FC = () => {
               )}
             </section>
           </div>
+          {compositionEditorCollapsed && (
+            <button
+              type="button"
+              onClick={() => setCompositionEditorCollapsed(false)}
+              className="absolute right-0 z-[51] flex items-center gap-1 rounded-l-2xl border border-r-0 border-white/20 px-2 py-3 text-[9px] font-medium tracking-[0.08em] text-white/75 shadow-2xl backdrop-blur-xl transition active:translate-x-0.5"
+              style={{ top: 'max(4.5rem, calc(var(--safe-top, 0px) + 3rem))', background: `linear-gradient(165deg, ${palette.panelTop}ee, ${palette.panelBottom}f8)`, boxShadow: `-12px 0 32px ${palette.shadow}a8` }}
+              aria-label="展开角色构图面板"
+              data-testid="companion-expand-composition"
+            >
+              <CaretLeft size={12} weight="bold" style={{ color: uiTint }} />
+              <span className="[writing-mode:vertical-rl]">展开构图</span>
+            </button>
+          )}
         </>
       )}
       </div>

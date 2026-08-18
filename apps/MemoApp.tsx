@@ -5,7 +5,7 @@ import { Memo, DeletedMemo, MemoType, MemoApiConfig, CharacterProfile } from '..
 import { MEMO_MAX, MEMO_CONTENT_MAX } from '../utils/memoInjection';
 import { polishMemo } from '../utils/memoPolish';
 import Modal from '../components/os/Modal';
-import { ArrowLeft, Plus, Trash, PencilSimple, Check, ArrowsClockwise, WarningCircle, Gear, NotePencil, Checks, CaretLeft, Circle, CheckCircle } from '@phosphor-icons/react';
+import { ArrowLeft, Plus, Trash, PencilSimple, Check, ArrowsClockwise, WarningCircle, Gear, NotePencil, Checks, CaretLeft, Circle, CheckCircle, X } from '@phosphor-icons/react';
 
 type View = 'home' | 'list' | 'trash';
 
@@ -157,7 +157,7 @@ const MemoApp: React.FC = () => {
         <div className="absolute inset-0 flex flex-col overflow-hidden bg-slate-50">
             {/* ─── 顶部导航栏（图1/图2：标题居中，左侧返回箭头，右侧操作按钮）── */}
             <div
-                className="flex items-center justify-between px-4 h-11 shrink-0 bg-white/80 backdrop-blur border-b border-slate-200/60"
+                className="flex items-center justify-between px-4 h-9 shrink-0 bg-white/80 backdrop-blur border-b border-slate-200/60"
                 style={{ paddingTop: 'max(0px, var(--safe-top))' }}
             >
                 <div className="flex items-center min-w-[56px]">
@@ -203,6 +203,13 @@ const MemoApp: React.FC = () => {
                     {view === 'home' && (
                         <div className="w-9" />
                     )}
+                    <button
+                        onClick={() => closeApp()}
+                        className="p-1.5 -mr-1 rounded-full hover:bg-red-50 hover:text-red-500 active:scale-90 transition-transform text-slate-500"
+                        title="退出"
+                    >
+                        <X className="w-5 h-5" weight="bold" />
+                    </button>
                 </div>
             </div>
 

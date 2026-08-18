@@ -201,8 +201,9 @@ async function handleCreate(args: Record<string, any>, deps: MemoToolDeps): Prom
     };
     await DB.saveMemo(memo);
 
-    // 用户侧提示
-    deps.addToast?.(`${deps.char.name} 建了一条备忘：${memo.content}`, 'success');
+    // 用户侧提示（图3变更动态：📝角色名 更新了备忘录 · [创建] 内容预览）
+    const preview = memo.content.length > 24 ? `${memo.content.slice(0, 24)}…` : memo.content;
+    deps.addToast?.(`📝 ${deps.char.name} 更新了备忘录 · [创建] ${preview}`, 'success');
 
     return `已创建：${formatMemoLine(memo, 0).replace(/^1\.\s/, '')}\n当前 ${existing.length + 1}/${MEMO_MAX} 条。`;
 }
@@ -246,7 +247,9 @@ async function handleUpdate(args: Record<string, any>, deps: MemoToolDeps): Prom
     };
     await DB.saveMemo(updated);
 
-    deps.addToast?.(`${deps.char.name} 改了一条备忘`, 'info');
+    // 用户侧提示（图3变更动态：[修改] 内容预览，引用样式）
+    const preview = updated.content.length > 24 ? `${updated.content.slice(0, 24)}…` : updated.content;
+    deps.addToast?.(`📝 ${deps.char.name} 更新了备忘录 · [修改] ${preview}`, 'info');
 
     return `已修改：${formatMemoLine(updated, idx - 1).replace(/^\d+\.\s/, '')}`;
 }
@@ -261,7 +264,9 @@ async function handleDelete(args: Record<string, any>, deps: MemoToolDeps): Prom
     const target = memos[idx - 1];
     await DB.softDeleteMemo(target.id);
 
-    deps.addToast?.(`${deps.char.name} 删了一条备忘（已进回收站，18 天内可恢复）`, 'info');
+    // 用户侧提示（图3变更动态：[删除] 内容预览）
+    const preview = target.content.length > 24 ? `${target.content.slice(0, 24)}…` : target.content;
+    deps.addToast?.(`📝 ${deps.char.name} 更新了备忘录 · [删除] ${preview}（已进回收站，18 天内可恢复）`, 'info');
 
     return `已删除第 ${idx} 条「${target.content}」（移入回收站，18 天内可恢复）。`;
 }
@@ -279,7 +284,9 @@ async function handleToggle(args: Record<string, any>, deps: MemoToolDeps): Prom
     const updated: Memo = { ...target, done: !target.done, updatedAt: Date.now() };
     await DB.saveMemo(updated);
 
-    deps.addToast?.(`${deps.char.name} ${updated.done ? '完成了' : '重置了'}一条待办`, 'info');
+    // 用户侧提示（图3变更动态：[完成]/[重置] 待办预览）
+    const preview = updated.content.length > 24 ? `${updated.content.slice(0, 24)}…` : updated.content;
+    deps.addToast?.(`📝 ${deps.char.name} 更新了备忘录 · [${updated.done ? '完成' : '重置'}] ${preview}`, 'info');
 
     return `已标记第 ${idx} 条「${target.content}」为${updated.done ? '已完成 ✓' : '未完成 □'}。`;
 }
